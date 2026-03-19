@@ -16,4 +16,5 @@ The private build repo publishes the application image and holds the active impl
 
 - `5tratMux` is currently in active prototype/buildout.
 - The private build repo is `WillItMod/5tratMux_Build`.
+- The build repo publishes the app image to `ghcr.io/willitmod/5tratmux-app`.
 - Public packaging and store recipe files can be added here as the app moves toward release.
