@@ -34,8 +34,8 @@ state, installation identity and licence data, performs a health check, and
 automatically restores the previous image if startup fails.
 
 Installing or updating 5tratMux does not start the trial. The recurring
-24-hour preview starts only after the user explicitly selects **Start my
-24-hour preview** inside Mux.
+48-hour early-adopter preview starts only after the user explicitly selects
+**Start my 48-hour preview** inside Mux.
 
 Useful commands:
 
