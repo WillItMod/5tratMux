@@ -25,6 +25,9 @@ SIGNATURE_URL="${MUX_SIGNATURE_URL:-${MANIFEST_URL}.sig}"
 LICENSING_URL="${MUX_LICENSING_URL:-https://5tratum.com/licensing}"
 LICENSING_PUBLIC_KEY="I_aujMd069Ki6ZYDw-qhQDQWM0JX5ymizbg7pqVakkE"
 HEALTH_URL="${MUX_HEALTH_URL:-http://127.0.0.1:21222/api/status}"
+WATCHDOG_STATE_DIR="${MUX_WATCHDOG_STATE_DIR:-/var/lib/5tratumos/5tratmux-watchdog}"
+WATCHDOG_INTERVAL="${MUX_WATCHDOG_INTERVAL:-120}"
+WATCHDOG_REINSTALL_COOLDOWN="${MUX_WATCHDOG_REINSTALL_COOLDOWN:-3600}"
 PUBLIC_KEY_FINGERPRINT="1d5901e7c64046d15fcdee8c0b1c962d6f946d4a620d2be2765fbb23c0673ddf"
 
 PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
@@ -79,6 +82,15 @@ finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
 PY
+}
+
+enable_watchdog_service() {
+  if ! command -v systemctl >/dev/null 2>&1 \
+    || ! systemctl cat 5tratmux-watchdog.service >/dev/null 2>&1; then
+    return 0
+  fi
+  systemctl enable 5tratmux-watchdog.service >/dev/null 2>&1 || true
+  systemctl start --no-block 5tratmux-watchdog.service >/dev/null 2>&1 || true
 }
 
 die() {
@@ -375,6 +387,7 @@ install_release() {
   fi
   printf '%s\n' "${version}" > "${RUNTIME_DIR}/installed-version"
   write_status "healthy" "5tratMux ${version} is healthy; licence and trial state were unchanged" "${version}"
+  enable_watchdog_service
   printf '5tratMux %s is healthy. Trial status was not changed.\n' "${version}"
 }
 
@@ -442,6 +455,7 @@ bootstrap_release() {
       "current" \
       "5tratMux ${installed} is already installed; licence and trial state were unchanged" \
       "${installed}"
+    enable_watchdog_service
     printf '5tratMux %s is already installed. Trial status was not changed.\n' \
       "${installed}"
     return 0
@@ -449,14 +463,127 @@ bootstrap_release() {
   install_release
 }
 
+health_ready() {
+  curl --fail --silent --show-error --max-time 8 "${HEALTH_URL}" >/dev/null 2>&1
+}
+
+updater_busy() {
+  if [[ -r "${STATUS_FILE}" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 - "${STATUS_FILE}" <<'PY' >/dev/null 2>&1
+import json
+import sys
+from datetime import datetime, timezone
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    updated = str(payload.get("updatedAt") or "").replace("Z", "+00:00")
+    age = 10**9
+    if updated:
+        stamp = datetime.fromisoformat(updated)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - stamp).total_seconds()
+    raise SystemExit(0 if bool(payload.get("busy")) and age < 1800 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    return $?
+  fi
+  return 1
+}
+
+watchdog_log() {
+  logger --tag 5tratmux-watchdog -- "$*" 2>/dev/null || true
+  printf '5tratMux watchdog: %s\n' "$*"
+}
+
+watchdog_wait_for_health() {
+  local attempt
+  for attempt in {1..15}; do
+    health_ready && return 0
+    sleep 2
+  done
+  return 1
+}
+
+watchdog_reinstall_allowed() {
+  local stamp now last
+  stamp="${WATCHDOG_STATE_DIR}/last-reinstall"
+  now="$(date +%s)"
+  last=0
+  if [[ -r "${stamp}" ]]; then
+    read -r last < "${stamp}" || last=0
+  fi
+  [[ "${last}" =~ ^[0-9]+$ ]] || last=0
+  (( now - last >= WATCHDOG_REINSTALL_COOLDOWN ))
+}
+
+watchdog_mark_reinstall() {
+  install -d -m 0755 "${WATCHDOG_STATE_DIR}"
+  date +%s > "${WATCHDOG_STATE_DIR}/last-reinstall"
+  chmod 0644 "${WATCHDOG_STATE_DIR}/last-reinstall"
+}
+
+watchdog_once() {
+  health_ready && return 0
+  updater_busy && {
+    watchdog_log "installation or update is active; health repair deferred"
+    return 0
+  }
+
+  # Confirm the failure before disturbing a working route.
+  sleep 5
+  health_ready && return 0
+
+  local container=""
+  if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    container="${CONTAINER_NAME}"
+  fi
+  if [[ -z "${container}" ]]; then
+    watchdog_log "runtime is absent; starting signed bootstrap"
+    "$0" --bootstrap || return 1
+    watchdog_wait_for_health
+    return $?
+  fi
+
+  watchdog_log "${container} is unhealthy; restarting its service"
+  docker restart --time 20 "${container}" >/dev/null || true
+  if watchdog_wait_for_health; then
+    watchdog_log "${container} recovered after restart"
+    return 0
+  fi
+
+  if ! watchdog_reinstall_allowed; then
+    watchdog_log "restart did not restore health; signed reinstall is rate-limited"
+    return 1
+  fi
+  watchdog_mark_reinstall
+  watchdog_log "restart did not restore health; repairing from the signed release"
+  "$0" --install || return 1
+  watchdog_wait_for_health
+}
+
+watchdog_release() {
+  require_root
+  require_commands
+  [[ "${WATCHDOG_INTERVAL}" =~ ^[0-9]+$ ]] || WATCHDOG_INTERVAL=120
+  (( WATCHDOG_INTERVAL >= 30 )) || WATCHDOG_INTERVAL=30
+  watchdog_log "service monitor started with a ${WATCHDOG_INTERVAL}s interval"
+  while true; do
+    watchdog_once || true
+    sleep "${WATCHDOG_INTERVAL}"
+  done
+}
+
 case "${1:---check}" in
   --check) check_release ;;
   --install|--update) install_release ;;
   --bootstrap) bootstrap_release ;;
+  --watchdog) watchdog_release ;;
   --rollback) rollback_release ;;
   --status) status_release ;;
   --help|-h)
-    printf 'Usage: %s --check|--install|--bootstrap|--rollback|--status\n' "$0"
+    printf 'Usage: %s --check|--install|--bootstrap|--watchdog|--rollback|--status\n' "$0"
     ;;
   *) die "unknown option: $1" ;;
 esac
