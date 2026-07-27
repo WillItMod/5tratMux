@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Root-owned deployments may override the signed release endpoint for a private
+# validation channel. Public installations do not need this file and continue
+# to use the pinned GitHub release channel below.
+UPDATER_ENV_FILE="${MUX_UPDATER_ENV_FILE:-/etc/5tratumos/5tratmux-updater.env}"
+if [[ -r "${UPDATER_ENV_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${UPDATER_ENV_FILE}"
+fi
+
+PRODUCT="5tratMux"
+CONTAINER_NAME="${MUX_CONTAINER_NAME:-5tratmux}"
+STATE_DIR="${MUX_STATE_DIR:-/var/lib/5tratumos/5tratmux}"
+CONFIG_DIR="${MUX_CONFIG_DIR:-/etc/5tratumos}"
+CONFIG_FILE="${MUX_CONFIG_FILE:-${CONFIG_DIR}/5tratmux.env}"
+CONTROLLER_TOKEN_FILE="${MUX_CONTROLLER_TOKEN_FILE:-${CONFIG_DIR}/5tratmux-controller.token}"
+RUNTIME_DIR="${MUX_RUNTIME_DIR:-/var/lib/5tratumos/5tratmux-updater}"
+STATUS_FILE="${MUX_STATUS_FILE:-${RUNTIME_DIR}/status.json}"
+PUBLIC_KEY_FILE="${RUNTIME_DIR}/update-signing-public.pem"
+DEFAULT_MANIFEST_URL="https://github.com/WillItMod/5tratMux/releases/latest/download/5tratmux-release.json"
+MANIFEST_URL="${MUX_MANIFEST_URL:-${DEFAULT_MANIFEST_URL}}"
+SIGNATURE_URL="${MUX_SIGNATURE_URL:-${MANIFEST_URL}.sig}"
+LICENSING_URL="${MUX_LICENSING_URL:-https://5tratum.com/licensing}"
+LICENSING_PUBLIC_KEY="I_aujMd069Ki6ZYDw-qhQDQWM0JX5ymizbg7pqVakkE"
+HEALTH_URL="${MUX_HEALTH_URL:-http://127.0.0.1:21222/api/status}"
+PUBLIC_KEY_FINGERPRINT="1d5901e7c64046d15fcdee8c0b1c962d6f946d4a620d2be2765fbb23c0673ddf"
+
+PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA6yiFKOdJV9Sn/yk97iuV/gGQD8A/PC8CZczr37eY1hY=
+-----END PUBLIC KEY-----'
+
+# Developer preview boxes deliberately retain their preview container name.
+# Public installations use ``5tratmux``. Detecting the preview locally keeps
+# the same signed updater testable without changing or duplicating state.
+if [[ -z "${MUX_CONTAINER_NAME:-}" ]] \
+  && command -v docker >/dev/null 2>&1 \
+  && ! docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1 \
+  && docker container inspect 5tratmux-preview >/dev/null 2>&1; then
+  CONTAINER_NAME="5tratmux-preview"
+fi
+
+write_status() {
+  local phase="${1:-idle}"
+  local message="${2:-}"
+  local version="${3:-}"
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  install -d -m 0755 "${RUNTIME_DIR}" 2>/dev/null || true
+  python3 - "${STATUS_FILE}" "${phase}" "${message}" "${version}" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+path, phase, message, version = sys.argv[1:]
+payload = {
+    "phase": phase,
+    "message": message,
+    "version": version,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "busy": phase in {"checking", "downloading", "installing", "rolling_back"},
+}
+directory = os.path.dirname(path)
+os.makedirs(directory, mode=0o755, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".5tratmux-update-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+}
+
+die() {
+  write_status "failed" "$*" ""
+  printf '5tratMux updater: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  [[ "$(id -u)" -eq 0 ]] || die "run this command with sudo"
+}
+
+require_commands() {
+  local command_name
+  for command_name in curl docker openssl python3 sha256sum; do
+    command -v "${command_name}" >/dev/null 2>&1 \
+      || die "required command is missing: ${command_name}"
+  done
+}
+
+architecture() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) die "unsupported CPU architecture: $(uname -m)" ;;
+  esac
+}
+
+version_key() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+value = sys.argv[1].strip()
+parts = []
+for token in re.split(r"[^0-9]+", value):
+    if token:
+        parts.append(int(token))
+print(".".join(f"{part:09d}" for part in (parts + [0, 0, 0])[:4]))
+PY
+}
+
+write_public_key() {
+  install -d -m 0755 "${RUNTIME_DIR}"
+  printf '%s\n' "${PUBLIC_KEY_PEM}" > "${PUBLIC_KEY_FILE}"
+  chmod 0644 "${PUBLIC_KEY_FILE}"
+  local fingerprint
+  fingerprint="$(
+    openssl pkey -pubin -in "${PUBLIC_KEY_FILE}" -outform DER 2>/dev/null \
+      | openssl dgst -sha256 \
+      | awk '{print $NF}'
+  )"
+  [[ "${fingerprint}" = "${PUBLIC_KEY_FINGERPRINT}" ]] \
+    || die "the embedded update key failed its fingerprint check"
+}
+
+download_manifest() {
+  local directory="$1"
+  local manifest_status installed
+  if ! manifest_status="$(
+    curl --silent --show-error --location \
+      --output "${directory}/manifest.json" \
+      --write-out '%{http_code}' \
+      "${MANIFEST_URL}"
+  )"; then
+    die "the signed release channel could not be reached; the installed version was not changed"
+  fi
+  if [[ "${manifest_status}" = "404" ]]; then
+    installed="$(installed_version)"
+    write_status \
+      "current" \
+      "No signed 5tratMux update has been published yet; ${installed} remains installed" \
+      "${installed}"
+    printf 'No signed 5tratMux update has been published yet. Installed version %s was not changed.\n' \
+      "${installed}"
+    exit 0
+  fi
+  [[ "${manifest_status}" =~ ^2[0-9][0-9]$ ]] \
+    || die "the signed release channel returned HTTP ${manifest_status}; the installed version was not changed"
+  if ! curl --fail --silent --show-error --location \
+    "${SIGNATURE_URL}" -o "${directory}/manifest.sig"; then
+    die "the signed release signature is unavailable; the installed version was not changed"
+  fi
+  openssl pkeyutl \
+    -verify \
+    -pubin \
+    -inkey "${PUBLIC_KEY_FILE}" \
+    -rawin \
+    -in "${directory}/manifest.json" \
+    -sigfile "${directory}/manifest.sig" >/dev/null \
+    || die "release manifest signature verification failed"
+}
+
+manifest_value() {
+  local manifest="$1"
+  local expression="$2"
+  python3 - "${manifest}" "${expression}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    value = json.load(handle)
+for part in sys.argv[2].split("."):
+    value = value[part]
+if isinstance(value, (dict, list)):
+    print(json.dumps(value, separators=(",", ":")))
+else:
+    print(value)
+PY
+}
+
+installed_version() {
+  if ! docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    printf 'not-installed\n'
+    return
+  fi
+  local value
+  value="$(
+    docker container inspect \
+    --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+    "${CONTAINER_NAME}" 2>/dev/null \
+      | sed '/^<no value>$/d'
+  )"
+  if [[ -z "${value}" ]]; then
+    value="$(
+      docker container inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "${CONTAINER_NAME}" 2>/dev/null \
+        | sed -n 's/^APP_VERSION=//p' \
+        | tail -n 1
+    )"
+  fi
+  if [[ -z "${value}" ]]; then
+    value="$(
+      docker container inspect \
+        --format '{{.Config.Image}}' \
+        "${CONTAINER_NAME}" 2>/dev/null \
+        | sed 's/^.*://'
+    )"
+  fi
+  printf '%s\n' "${value:-unknown}"
+}
+
+ensure_config() {
+  install -d -m 0755 "${CONFIG_DIR}"
+  install -d -m 0700 "${STATE_DIR}"
+  chown 0:0 "${STATE_DIR}"
+  if [[ ! -s "${CONTROLLER_TOKEN_FILE}" ]]; then
+    umask 077
+    if command -v openssl >/dev/null 2>&1; then
+      openssl rand -base64 48 > "${CONTROLLER_TOKEN_FILE}"
+    else
+      python3 - "${CONTROLLER_TOKEN_FILE}" <<'PY'
+import secrets
+import sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write(secrets.token_urlsafe(48) + "\n")
+PY
+    fi
+  fi
+  chown 0:0 "${CONTROLLER_TOKEN_FILE}"
+  chmod 0600 "${CONTROLLER_TOKEN_FILE}"
+  if [[ -s "${CONFIG_FILE}" ]]; then
+    chmod 0600 "${CONFIG_FILE}"
+    return
+  fi
+  local host_ip
+  host_ip="$(
+    ip -4 route get 1.1.1.1 2>/dev/null \
+      | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}'
+  )"
+  host_ip="${host_ip:-127.0.0.1}"
+  {
+    printf 'APP_HOST=0.0.0.0\n'
+    printf 'APP_PORT=21222\n'
+    printf 'APP_CHANNEL=MAIN\n'
+    printf 'APP_PUBLIC_HOST=%s\n' "${host_ip}"
+    printf 'MUX_UPSTREAM_HOST=127.0.0.1\n'
+    printf 'MUX_LICENSING_URL=%s\n' "${LICENSING_URL}"
+    printf 'MUX_LICENSING_PUBLIC_KEY=%s\n' "${LICENSING_PUBLIC_KEY}"
+  } > "${CONFIG_FILE}"
+  chmod 0600 "${CONFIG_FILE}"
+}
+
+container_mounts() {
+  local candidate destination
+  while IFS='|' read -r candidate destination; do
+    if [[ -e "${candidate}" ]]; then
+      printf -- '--mount\ntype=bind,src=%s,dst=%s,readonly\n' \
+        "${candidate}" "${destination}"
+    fi
+  done <<'EOF'
+/etc/5tratumos/5tratmux-controller.token|/run/5tratumos/5tratmux-controller-token
+/etc/machine-id|/run/5tratumos/machine-id
+/var/lib/5tratumos/support/install_id.txt|/run/5tratumos/install-id
+/var/lib/5tratumos/support/licensing_identity.json|/run/5tratumos/licensing-identity.json
+EOF
+}
+
+start_container() {
+  local image="$1"
+  local release_channel="$2"
+  local -a mounts=()
+  while IFS= read -r line; do
+    mounts+=("${line}")
+  done < <(container_mounts)
+  docker run \
+    --detach \
+    --name "${CONTAINER_NAME}" \
+    --network host \
+    --restart unless-stopped \
+    --read-only \
+    --tmpfs "/tmp:rw,exec,nosuid,nodev,size=256m" \
+    --pids-limit 256 \
+    --security-opt no-new-privileges:true \
+    --cap-drop ALL \
+    --env-file "${CONFIG_FILE}" \
+    --env "APP_CHANNEL=${release_channel}" \
+    --mount "type=bind,src=${STATE_DIR},dst=/data/ui/state" \
+    "${mounts[@]}" \
+    "${image}" >/dev/null
+}
+
+wait_for_health() {
+  local attempt
+  for attempt in {1..30}; do
+    if curl --fail --silent --show-error "${HEALTH_URL}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+install_release() {
+  require_root
+  require_commands
+  write_public_key
+  ensure_config
+
+  local work arch version channel image url digest archive current_image backup_name
+  work="$(mktemp -d)"
+  trap 'rm -rf "${work:-}"' EXIT
+  write_status "checking" "Verifying the signed release manifest" ""
+  download_manifest "${work}"
+  arch="$(architecture)"
+  version="$(manifest_value "${work}/manifest.json" version)"
+  channel="$(manifest_value "${work}/manifest.json" channel)"
+  [[ "${channel}" = "MAIN" ]] \
+    || die "signed public releases must declare the MAIN channel"
+  image="$(manifest_value "${work}/manifest.json" "images.${arch}.image")"
+  url="$(manifest_value "${work}/manifest.json" "images.${arch}.url")"
+  digest="$(manifest_value "${work}/manifest.json" "images.${arch}.sha256")"
+  archive="${work}/5tratmux.oci.tar.gz"
+
+  write_status "downloading" "Downloading and verifying 5tratMux ${version} for ${arch}" "${version}"
+  printf 'Downloading 5tratMux %s for %s...\n' "${version}" "${arch}"
+  curl --fail --silent --show-error --location "${url}" -o "${archive}"
+  printf '%s  %s\n' "${digest}" "${archive}" | sha256sum --check --status \
+    || die "OCI archive checksum verification failed"
+  docker load --input "${archive}" >/dev/null
+  docker image inspect "${image}" >/dev/null \
+    || die "verified archive did not contain ${image}"
+
+  write_status "installing" "Installing 5tratMux ${version}; settings and licence state are preserved" "${version}"
+  current_image=""
+  if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    current_image="$(
+      docker container inspect --format '{{.Image}}' "${CONTAINER_NAME}"
+    )"
+    docker image tag "${current_image}" 5tratmux:rollback
+    docker stop "${CONTAINER_NAME}" >/dev/null
+    backup_name="${CONTAINER_NAME}-previous-$(date +%s)"
+    docker rename "${CONTAINER_NAME}" "${backup_name}"
+  else
+    backup_name=""
+  fi
+
+  if ! start_container "${image}" "${channel}" || ! wait_for_health; then
+    docker container rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    if [[ -n "${backup_name}" ]]; then
+      docker rename "${backup_name}" "${CONTAINER_NAME}"
+      docker start "${CONTAINER_NAME}" >/dev/null
+    fi
+    die "new release failed its health check; the previous release was restored"
+  fi
+
+  if [[ -n "${backup_name}" ]]; then
+    docker container rm "${backup_name}" >/dev/null
+  fi
+  local updater_source updater_target
+  updater_target="/usr/local/sbin/5tratmux-update"
+  updater_source="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  if [[ "${updater_source}" != "${updater_target}" ]]; then
+    install -m 0755 "$0" "${updater_target}"
+  fi
+  printf '%s\n' "${version}" > "${RUNTIME_DIR}/installed-version"
+  write_status "healthy" "5tratMux ${version} is healthy; licence and trial state were unchanged" "${version}"
+  printf '5tratMux %s is healthy. Trial status was not changed.\n' "${version}"
+}
+
+rollback_release() {
+  require_root
+  require_commands
+  write_status "rolling_back" "Restoring the previous verified 5tratMux release" ""
+  docker image inspect 5tratmux:rollback >/dev/null 2>&1 \
+    || die "no rollback image is available"
+  ensure_config
+  local rollback_channel
+  rollback_channel="$(
+    docker image inspect \
+      --format '{{ index .Config.Labels "com.5tratumos.channel" }}' \
+      5tratmux:rollback 2>/dev/null || true
+  )"
+  rollback_channel="${rollback_channel:-DEV}"
+  if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    docker container rm --force "${CONTAINER_NAME}" >/dev/null
+  fi
+  start_container 5tratmux:rollback "${rollback_channel}"
+  wait_for_health || die "rollback image did not become healthy"
+  write_status "healthy" "The previous verified 5tratMux release is healthy" "$(installed_version)"
+  printf '5tratMux rollback image is healthy.\n'
+}
+
+check_release() {
+  require_commands
+  write_status "checking" "Checking the signed 5tratMux release channel" ""
+  write_public_key
+  local work available installed
+  work="$(mktemp -d)"
+  trap 'rm -rf "${work:-}"' EXIT
+  download_manifest "${work}"
+  available="$(manifest_value "${work}/manifest.json" version)"
+  installed="$(installed_version)"
+  printf 'Installed: %s\nAvailable: %s\n' "${installed}" "${available}"
+  if [[ "${installed}" = "not-installed" ]] \
+    || [[ "$(version_key "${available}")" > "$(version_key "${installed}")" ]]; then
+    write_status "update_available" "5tratMux ${available} is ready to install" "${available}"
+    printf 'Update available.\n'
+    return 10
+  fi
+  write_status "current" "5tratMux ${installed} is current" "${installed}"
+  printf '5tratMux is current.\n'
+}
+
+status_release() {
+  local installed state
+  installed="$(installed_version)"
+  state="stopped"
+  if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    state="$(
+      docker container inspect --format '{{.State.Status}}' "${CONTAINER_NAME}"
+    )"
+  fi
+  printf '5tratMux %s · %s\n' "${installed}" "${state}"
+}
+
+bootstrap_release() {
+  local installed
+  installed="$(installed_version)"
+  if [[ "${installed}" != "not-installed" ]]; then
+    write_status \
+      "current" \
+      "5tratMux ${installed} is already installed; licence and trial state were unchanged" \
+      "${installed}"
+    printf '5tratMux %s is already installed. Trial status was not changed.\n' \
+      "${installed}"
+    return 0
+  fi
+  install_release
+}
+
+case "${1:---check}" in
+  --check) check_release ;;
+  --install|--update) install_release ;;
+  --bootstrap) bootstrap_release ;;
+  --rollback) rollback_release ;;
+  --status) status_release ;;
+  --help|-h)
+    printf 'Usage: %s --check|--install|--bootstrap|--rollback|--status\n' "$0"
+    ;;
+  *) die "unknown option: $1" ;;
+esac
