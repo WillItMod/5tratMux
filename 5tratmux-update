@@ -27,6 +27,7 @@ MUX_DNS_PRIMARY="${MUX_DNS_PRIMARY:-1.1.1.1}"
 MUX_DNS_SECONDARY="${MUX_DNS_SECONDARY:-8.8.8.8}"
 LICENSING_PUBLIC_KEY="I_aujMd069Ki6ZYDw-qhQDQWM0JX5ymizbg7pqVakkE"
 HEALTH_URL="${MUX_HEALTH_URL:-http://127.0.0.1:21222/api/health}"
+HEALTH_ATTEMPTS="${MUX_HEALTH_ATTEMPTS:-120}"
 WATCHDOG_STATE_DIR="${MUX_WATCHDOG_STATE_DIR:-/var/lib/5tratumos/5tratmux-watchdog}"
 WATCHDOG_INTERVAL="${MUX_WATCHDOG_INTERVAL:-120}"
 WATCHDOG_REINSTALL_COOLDOWN="${MUX_WATCHDOG_REINSTALL_COOLDOWN:-3600}"
@@ -336,7 +337,10 @@ start_container() {
 
 wait_for_health() {
   local attempt
-  for attempt in {1..30}; do
+  if [[ ! "${HEALTH_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
+    HEALTH_ATTEMPTS=120
+  fi
+  for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
     if curl --fail --silent --show-error "${HEALTH_URL}" >/dev/null 2>&1; then
       return 0
     fi
