@@ -23,6 +23,8 @@ DEFAULT_MANIFEST_URL="https://github.com/WillItMod/5tratMux/releases/latest/down
 MANIFEST_URL="${MUX_MANIFEST_URL:-${DEFAULT_MANIFEST_URL}}"
 SIGNATURE_URL="${MUX_SIGNATURE_URL:-${MANIFEST_URL}.sig}"
 LICENSING_URL="${MUX_LICENSING_URL:-https://5tratum.com/licensing}"
+MUX_DNS_PRIMARY="${MUX_DNS_PRIMARY:-1.1.1.1}"
+MUX_DNS_SECONDARY="${MUX_DNS_SECONDARY:-8.8.8.8}"
 LICENSING_PUBLIC_KEY="I_aujMd069Ki6ZYDw-qhQDQWM0JX5ymizbg7pqVakkE"
 HEALTH_URL="${MUX_HEALTH_URL:-http://127.0.0.1:21222/api/health}"
 WATCHDOG_STATE_DIR="${MUX_WATCHDOG_STATE_DIR:-/var/lib/5tratumos/5tratmux-watchdog}"
@@ -124,11 +126,29 @@ version_key() {
 import re
 import sys
 value = sys.argv[1].strip()
-parts = []
-for token in re.split(r"[^0-9]+", value):
-    if token:
-        parts.append(int(token))
-print(".".join(f"{part:09d}" for part in (parts + [0, 0, 0])[:4]))
+match = re.match(r"^\s*v?(\d+(?:\.\d+)*)(?:[-+](.*))?\s*$", value)
+if not match:
+    print("000000000.000000000.000000000.0.000000000")
+    raise SystemExit
+parts = [int(token) for token in match.group(1).split(".")]
+parts = (parts + [0, 0, 0])[:3]
+suffix = (match.group(2) or "").strip().lower()
+if not suffix:
+    rank = 5
+elif suffix.startswith("rc"):
+    rank = 4
+elif "beta" in suffix:
+    rank = 3
+elif "alpha" in suffix:
+    rank = 2
+else:
+    rank = 1
+suffix_number = re.search(r"(\d+)", suffix)
+suffix_number = int(suffix_number.group(1)) if suffix_number else 0
+print(
+    ".".join(f"{part:09d}" for part in parts)
+    + f".{rank}.{suffix_number:09d}"
+)
 PY
 }
 
@@ -299,6 +319,8 @@ start_container() {
     --detach \
     --name "${CONTAINER_NAME}" \
     --network host \
+    --dns "${MUX_DNS_PRIMARY}" \
+    --dns "${MUX_DNS_SECONDARY}" \
     --restart unless-stopped \
     --read-only \
     --tmpfs "/tmp:rw,exec,nosuid,nodev,size=256m" \
@@ -330,6 +352,7 @@ install_release() {
   ensure_config
 
   local work arch version channel image url digest archive current_image backup_name
+  local installed installed_key available_key
   work="$(mktemp -d)"
   trap 'rm -rf "${work:-}"' EXIT
   write_status "checking" "Verifying the signed release manifest" ""
@@ -339,6 +362,21 @@ install_release() {
   channel="$(manifest_value "${work}/manifest.json" channel)"
   [[ "${channel}" = "MAIN" ]] \
     || die "signed public releases must declare the MAIN channel"
+  installed="$(installed_version)"
+  installed_key="$(version_key "${installed}")"
+  available_key="$(version_key "${version}")"
+  if [[ -n "${installed}" && (
+    "${installed_key}" > "${available_key}"
+    || "${installed_key}" = "${available_key}"
+  ) ]]; then
+    write_status \
+      "current" \
+      "Installed 5tratMux ${installed} is not older than signed release ${version}; no downgrade was performed" \
+      "${installed}"
+    enable_watchdog_service
+    printf '5tratMux %s was preserved; signed release %s is not newer.\n' "${installed}" "${version}"
+    return 0
+  fi
   image="$(manifest_value "${work}/manifest.json" "images.${arch}.image")"
   url="$(manifest_value "${work}/manifest.json" "images.${arch}.url")"
   digest="$(manifest_value "${work}/manifest.json" "images.${arch}.sha256")"
