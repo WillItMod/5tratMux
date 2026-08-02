@@ -33,9 +33,11 @@ architecture-specific OCI archive before Docker loads it. It preserves local
 state, installation identity and licence data, performs a health check, and
 automatically restores the previous image if startup fails.
 
-Installing or updating 5tratMux does not start the trial. The recurring
-48-hour early-adopter preview starts only after the user explicitly selects
-**Start my 48-hour preview** inside Mux.
+Installing or updating 5tratMux does not start the trial. An eligible
+168-hour preview starts only after the user explicitly selects
+**Start 168-hour preview** inside Mux. When that preview ends, another can
+become available after the current 90-day cooldown. The cooldown does not
+start a trial automatically.
 
 Useful commands:
 

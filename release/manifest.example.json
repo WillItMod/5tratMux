@@ -2,18 +2,18 @@
   "schema": 1,
   "product": "5tratMux",
   "channel": "MAIN",
-  "version": "0.8.67",
-  "minimumOsVersion": "0.5.9",
-  "publishedAt": "2026-07-26T00:00:00Z",
+  "version": "0.9.20",
+  "minimumOsVersion": "0.7.1",
+  "publishedAt": "2026-08-02T00:00:00Z",
   "images": {
     "amd64": {
-      "image": "5tratmux:0.8.67-amd64",
-      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.8.67/5tratmux-0.8.67-amd64.oci.tar.gz",
+      "image": "5tratmux:0.9.20-amd64",
+      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.9.20/5tratmux-0.9.20-amd64.oci.tar.gz",
       "sha256": "REPLACE_WITH_RELEASE_DIGEST"
     },
     "arm64": {
-      "image": "5tratmux:0.8.67-arm64",
-      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.8.67/5tratmux-0.8.67-arm64.oci.tar.gz",
+      "image": "5tratmux:0.9.20-arm64",
+      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.9.20/5tratmux-0.9.20-arm64.oci.tar.gz",
       "sha256": "REPLACE_WITH_RELEASE_DIGEST"
     }
   }
