@@ -2,19 +2,19 @@
   "schema": 1,
   "product": "5tratMux",
   "channel": "MAIN",
-  "version": "0.9.36",
+  "version": "0.9.41",
   "minimumOsVersion": "0.5.9",
-  "publishedAt": "2026-08-05T17:50:35Z",
+  "publishedAt": "2026-08-06T19:19:44Z",
   "images": {
     "amd64": {
-      "image": "5tratmux:0.9.36-amd64",
-      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.9.36/5tratmux-0.9.36-amd64.oci.tar.gz",
-      "sha256": "16e09b931e31b75d5c4196f764cd36591723b1bbf23af00b2e552701e049e207"
+      "image": "5tratmux:0.9.41-amd64",
+      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.9.41/5tratmux-0.9.41-amd64.oci.tar.gz",
+      "sha256": "8e3cd3d264ff713320ec136fe4a1da0fd5f5f2050f111a6b9725ecaf466ad52a"
     },
     "arm64": {
-      "image": "5tratmux:0.9.36-arm64",
-      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.9.36/5tratmux-0.9.36-arm64.oci.tar.gz",
-      "sha256": "985f63dd7aba267b781dd5941e86b1c403850b081e8b773f372c63f06140bfc7"
+      "image": "5tratmux:0.9.41-arm64",
+      "url": "https://github.com/WillItMod/5tratMux/releases/download/v0.9.41/5tratmux-0.9.41-arm64.oci.tar.gz",
+      "sha256": "0b7757cb728b1d3da59587050ef4a6350d048d2972604ee05664c2d1057e8cf0"
     }
   }
 }
