@@ -48,6 +48,19 @@ sudo /usr/local/sbin/5tratmux-update --install
 sudo /usr/local/sbin/5tratmux-update --rollback
 ```
 
+## Optional Local AI
+
+With 5tratumOS 0.8.4, compatible Linux AMD64 hosts can install the managed Local
+5TRATMUX provider from AI Automation. An active paid licence is required;
+trials cannot download or run local models. Choose Qwen3.5 0.8B, 2B or 4B:
+only the selected model is downloaded, with pinned source and integrity checks.
+CPU features (including AVX2), available RAM and disk space are checked before
+use. ARM local inference is not qualified by this release.
+
+Native 0.9.49 restores MUX Attack monitoring and app-validated local launches for
+this provider. Saved evidence thresholds and paid-access checks still apply;
+selecting Local AI does not authorize arbitrary model-generated launch plans.
+
 ## Public ports
 
 - Web control: `21222/tcp` on the 5tratumOS host
