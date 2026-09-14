@@ -48,6 +48,27 @@ sudo /usr/local/sbin/5tratmux-update --install
 sudo /usr/local/sbin/5tratmux-update --rollback
 ```
 
+## Licence backup and PC replacement
+
+With 5tratMux 0.9.52, save your licence-proof JSON from **System → Licensing**.
+After reinstalling 5tratumOS or moving to another PC, upload that proof in the
+same screen and confirm **Move licence to this PC**. The 5tratumOS Settings
+licence shortcut opens this screen directly on OS versions that include it.
+
+Each paid licence supports **five self-service moves in total**. A move keeps
+the original plan and expiry; it does not start a fresh annual term. Repeating
+the same restore on the already-bound installation does not consume a move.
+An older valid backup can still be used within the same five-move allowance.
+The interface shows how many moves remain, and the current proof can be
+downloaded again after refreshing the browser.
+
+Restoration requires an internet connection. The authority retires the old
+binding when it activates the replacement. An online old installation loses
+paid access at its next successful licensing check; an offline installation
+can retain access until its previously signed offline lease/grace expires.
+Keep the proof private: it contains a recovery secret. Contact support if the
+proof is missing or the self-service allowance is exhausted.
+
 ## Optional Local AI
 
 With 5tratumOS 0.8.4, compatible Linux AMD64 hosts can install the managed Local
