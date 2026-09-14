@@ -104,3 +104,9 @@ control of its own payout wallet and block construction.
 The public release-signing key fingerprint is:
 
 `SHA-256 1d5901e7c64046d15fcdee8c0b1c962d6f946d4a620d2be2765fbb23c0673ddf`
+
+## Block metrics in 0.9.53
+
+Recorded hashrates are now shown consistently, and exact submission evidence
+survives restarts. Blockchain-only payout matches remain clearly distinguished
+from miner-attributed blocks. See [the release notes](release/notes/v0.9.53.md).
