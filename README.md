@@ -110,3 +110,12 @@ The public release-signing key fingerprint is:
 Recorded hashrates are now shown consistently, and exact submission evidence
 survives restarts. Blockchain-only payout matches remain clearly distinguished
 from miner-attributed blocks. See [the release notes](release/notes/v0.9.53.md).
+
+## Local AI recovery in 0.9.54
+
+Local AI research now survives a failed address when DNS supplies another safe
+route, preventing one dead IPv6 or CDN endpoint from putting every tracked coin
+into Hold-Route. The Local AI panel also supports signed in-place runtime
+updates and explicit model switching without deleting downloaded models or
+forgetting the previous On/Off state. See
+[the release notes](release/notes/v0.9.54.md).
