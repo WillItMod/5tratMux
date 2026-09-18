@@ -48,6 +48,43 @@ sudo /usr/local/sbin/5tratmux-update --install
 sudo /usr/local/sbin/5tratmux-update --rollback
 ```
 
+## Connecting a new miner
+
+Before connecting, power Mux on, check active access in **System**, and make
+sure **Pools** has an enabled, healthy destination for the miner's algorithm.
+
+1. In **Setup**, select **Scan local network**, or enter the miner's IP and
+   select **Check this miner**. This reads supported management APIs; finding
+   a miner does not change its pool settings. An empty scan does not prevent
+   manual connection.
+2. If automatic configuration is supported, select **Review before changing**,
+   check the details, then confirm **Route through 5tratMux**. Otherwise open
+   the miner's own pool settings and copy the pool URL, username/worker and
+   password from Mux's **Manual connection** card. Save the settings and let
+   the miner reconnect; restart its mining service if the firmware requires it.
+   Preserve existing pools as fallbacks.
+3. A successful connection adds the worker to **Miners** automatically. Select
+   its card, choose compatible pools totalling **100%**, and select
+   **Apply allocation**. Look for a live route and increasing accepted shares.
+   **ADD** selects an existing miner for a shared allocation; it does not
+   register a new miner or enable AI.
+4. For optional automation, open **AI Automation**, configure your provider,
+   select this miner and its allowed chains in the desired mode, then select
+   **Enable mode** or **Update mode**. An existing mode does not automatically
+   add a newly connected miner to its selection.
+
+Use the Mux box's LAN address as the pool host, not the miner's IP or
+`localhost`. The default endpoint is `stratum+tcp://MUX_LAN_IP:7331`; copy the
+displayed values if the installation uses a different port. Give each miner a
+unique username/worker, such as `S19J-Garage`. `MyMiner` is a valid SHA256
+example, not a required name. Manual Scrypt connections use
+`scrypt.YOUR_WORKER` on the same port. Payout settings stay in the destination
+pool application.
+
+Discovery, hardware hashrate and a ping reply do not prove that work reaches a
+pool through Mux. A live route and accepted shares provide that evidence.
+Local AI can remain off when using manual routing or another AI provider.
+
 ## Licence backup and PC replacement
 
 With 5tratMux 0.9.52, save your licence-proof JSON from **System → Licensing**.
@@ -119,3 +156,14 @@ into Hold-Route. The Local AI panel also supports signed in-place runtime
 updates and explicit model switching without deleting downloaded models or
 forgetting the previous On/Off state. See
 [the release notes](release/notes/v0.9.54.md).
+
+## Miner discovery and connection guidance in 0.9.55
+
+Recognised CGMiner-compatible devices now appear in discovery with manual
+connection instructions when automatic configuration is unsupported. A
+restricted pool-settings read no longer hides an otherwise identified miner.
+Earlier local authorization responses improve compatibility with miners that
+have short handshake deadlines, while upstream authorization remains required
+before mining work is forwarded. Setup and routing screens now explain the
+connection steps and distinguish an absent session from an active route. See
+[the release notes](release/notes/v0.9.55.md).
