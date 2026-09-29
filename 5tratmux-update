@@ -176,12 +176,25 @@ require_root() {
 with_lifecycle_lock() (
   # Shared with OS-owned DNS changes. Do not overwrite another operation's
   # status when it holds this lock, and do not retain it between watchdog polls.
+  # A supervised OS bundle handoff must survive a watchdog already starting
+  # the old app. Interactive actions and watchdog polls remain nonblocking.
+  local lock_args=(--nonblock)
+  if [[ "${1:-}" = "--wait-bundle" ]]; then
+    shift
+    local wait_seconds="${MUX_BUNDLE_LOCK_WAIT_SECONDS:-300}"
+    if [[ ! "${wait_seconds}" =~ ^[1-9][0-9]{0,2}$ ]] || (( wait_seconds > 600 )); then
+      printf '5tratMux: bundle lock wait must be between 1 and 600 seconds.\n' >&2
+      exit 2
+    fi
+    lock_args=(--timeout "${wait_seconds}")
+    printf '5tratMux: waiting up to %s seconds for the update/DNS lifecycle lock.\n' "${wait_seconds}" >&2
+  fi
   require_root
   command -v flock >/dev/null 2>&1 || die "required command is missing: flock"
   umask 077
   mkdir -p "$(dirname "${LIFECYCLE_LOCK_FILE}")"
   exec 9>"${LIFECYCLE_LOCK_FILE}"
-  if ! flock --nonblock 9; then
+  if ! flock "${lock_args[@]}" 9; then
     printf '5tratMux: another update or DNS change is in progress; retry when it finishes.\n' >&2
     exit 75
   fi
@@ -881,7 +894,7 @@ case "${1:---check}" in
   --install|--update) with_lifecycle_lock install_release ;;
   --install-bundle)
     [[ $# -eq 2 && -n "$2" && -d "$2" ]] || die "usage: --install-bundle DIRECTORY"
-    with_lifecycle_lock install_release "$2"
+    with_lifecycle_lock --wait-bundle install_release "$2"
     ;;
   --bootstrap) with_lifecycle_lock bootstrap_release ;;
   --watchdog) watchdog_release ;;
