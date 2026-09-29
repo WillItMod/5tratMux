@@ -15,6 +15,9 @@ CONTAINER_NAME="${MUX_CONTAINER_NAME:-5tratmux}"
 STATE_DIR="${MUX_STATE_DIR:-/var/lib/5tratumos/5tratmux}"
 CONFIG_DIR="${MUX_CONFIG_DIR:-/etc/5tratumos}"
 CONFIG_FILE="${MUX_CONFIG_FILE:-${CONFIG_DIR}/5tratmux.env}"
+DNS_CONFIG_FILE="${MUX_DNS_CONFIG_FILE:-${CONFIG_DIR}/5tratmux-dns.json}"
+LIFECYCLE_LOCK_FILE="${MUX_LIFECYCLE_LOCK_FILE:-/run/lock/5tratmux-lifecycle.lock}"
+DNS_OPERATION_FILE="${MUX_DNS_OPERATION_FILE:-/var/lib/5tratumos/mux-dns-apply.json}"
 CONTROLLER_TOKEN_FILE="${MUX_CONTROLLER_TOKEN_FILE:-${CONFIG_DIR}/5tratmux-controller.token}"
 RUNTIME_DIR="${MUX_RUNTIME_DIR:-/var/lib/5tratumos/5tratmux-updater}"
 STATUS_FILE="${MUX_STATUS_FILE:-${RUNTIME_DIR}/status.json}"
@@ -135,6 +138,38 @@ die() {
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || die "run this command with sudo"
 }
+
+with_lifecycle_lock() (
+  # Shared with OS-owned DNS changes. Do not overwrite another operation's
+  # status when it holds this lock, and do not retain it between watchdog polls.
+  require_root
+  command -v flock >/dev/null 2>&1 || die "required command is missing: flock"
+  umask 077
+  mkdir -p "$(dirname "${LIFECYCLE_LOCK_FILE}")"
+  exec 9>"${LIFECYCLE_LOCK_FILE}"
+  if ! flock --nonblock 9; then
+    printf '5tratMux: another update or DNS change is in progress; retry when it finishes.\n' >&2
+    exit 75
+  fi
+  if ! python3 - "${DNS_OPERATION_FILE}" <<'PY'
+import json
+import os
+import sys
+try:
+    if os.path.exists(sys.argv[1]):
+        with open(sys.argv[1], encoding="utf-8") as handle:
+            state = json.load(handle)
+        if not isinstance(state, dict) or state.get("applying") or state.get("rollback") == "requires_inspection":
+            raise ValueError("unfinished DNS change")
+except (OSError, ValueError, TypeError):
+    print("5tratMux: an unresolved DNS change needs attention before another update or restart.", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    exit 75
+  fi
+  "$@"
+)
 
 require_commands() {
   local command_name
@@ -375,6 +410,43 @@ PY
   chmod 0600 "${CONFIG_FILE}"
 }
 
+configured_dns_servers() {
+  # DNS is separate from the release-channel environment file so an OS/MUX
+  # update cannot discard the user's resolver choice. Never source this JSON.
+  python3 - "${DNS_CONFIG_FILE}" "${MUX_DNS_PRIMARY}" "${MUX_DNS_SECONDARY}" <<'PY'
+import ipaddress
+import json
+import os
+import sys
+
+try:
+    path, primary, secondary = sys.argv[1:]
+    servers = [primary, secondary]
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            settings = json.load(handle)
+        if not isinstance(settings, dict) or settings.get("mode") not in {"default", "custom"}:
+            raise ValueError("invalid mode")
+        servers = ["1.1.1.1", "8.8.8.8"] if settings["mode"] == "default" else settings.get("servers")
+    if not isinstance(servers, list) or not 1 <= len(servers) <= 3:
+        raise ValueError("invalid DNS server count")
+    result = []
+    for value in servers:
+        if not isinstance(value, str) or not value or value != value.strip() or "%" in value:
+            raise ValueError("invalid DNS address")
+        address = ipaddress.ip_address(value)
+        if address.is_unspecified or address.is_multicast or str(address) == "255.255.255.255":
+            raise ValueError("invalid DNS address")
+        normalized = str(address)
+        if normalized not in result:
+            result.append(normalized)
+    print("\n".join(result))
+except (ValueError, TypeError, OSError):
+    print("Invalid saved 5tratMux DNS settings; correct the DNS configuration before updating.", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 container_mounts() {
   local candidate destination
   while IFS='|' read -r candidate destination; do
@@ -393,7 +465,12 @@ EOF
 start_container() {
   local image="$1"
   local release_channel="$2"
-  local -a mounts=()
+  local dns_values
+  local -a mounts=() dns_args=()
+  dns_values="$(configured_dns_servers)" || return 1
+  while IFS= read -r line; do
+    dns_args+=(--dns "${line}")
+  done <<< "${dns_values}"
   while IFS= read -r line; do
     mounts+=("${line}")
   done < <(container_mounts)
@@ -401,8 +478,7 @@ start_container() {
     --detach \
     --name "${CONTAINER_NAME}" \
     --network host \
-    --dns "${MUX_DNS_PRIMARY}" \
-    --dns "${MUX_DNS_SECONDARY}" \
+    "${dns_args[@]}" \
     --restart unless-stopped \
     --read-only \
     --tmpfs "/tmp:rw,exec,nosuid,nodev,size=256m" \
@@ -435,6 +511,7 @@ install_release() {
   require_commands
   write_public_key
   ensure_config
+  configured_dns_servers >/dev/null || die "saved DNS settings are invalid; the installed version was not changed"
 
   local work arch version channel image url digest archive current_image backup_name
   local installed installed_key available_key
@@ -529,6 +606,7 @@ rollback_release() {
   docker image inspect 5tratmux:rollback >/dev/null 2>&1 \
     || die "no rollback image is available"
   ensure_config
+  configured_dns_servers >/dev/null || die "saved DNS settings are invalid; the installed version was not changed"
   local rollback_channel
   rollback_channel="$(
     docker image inspect \
@@ -697,7 +775,7 @@ watchdog_once() {
   fi
   if [[ -z "${container}" ]]; then
     watchdog_log "runtime is absent; starting signed bootstrap"
-    "$0" --bootstrap || return 1
+    bootstrap_release || return 1
     watchdog_wait_for_health
     return $?
   fi
@@ -715,7 +793,7 @@ watchdog_once() {
   fi
   watchdog_mark_reinstall
   watchdog_log "restart did not restore health; repairing from the signed release"
-  "$0" --install || return 1
+  install_release || return 1
   watchdog_wait_for_health
 }
 
@@ -726,17 +804,17 @@ watchdog_release() {
   (( WATCHDOG_INTERVAL >= 30 )) || WATCHDOG_INTERVAL=30
   watchdog_log "service monitor started with a ${WATCHDOG_INTERVAL}s interval"
   while true; do
-    watchdog_once || true
+    with_lifecycle_lock watchdog_once || true
     sleep "${WATCHDOG_INTERVAL}"
   done
 }
 
 case "${1:---check}" in
   --check) check_release ;;
-  --install|--update) install_release ;;
-  --bootstrap) bootstrap_release ;;
+  --install|--update) with_lifecycle_lock install_release ;;
+  --bootstrap) with_lifecycle_lock bootstrap_release ;;
   --watchdog) watchdog_release ;;
-  --rollback) rollback_release ;;
+  --rollback) with_lifecycle_lock rollback_release ;;
   --status) status_release ;;
   --help|-h)
     printf 'Usage: %s --check|--install|--bootstrap|--watchdog|--rollback|--status\n' "$0"
