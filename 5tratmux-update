@@ -5,9 +5,43 @@ set -Eeuo pipefail
 # validation channel. Public installations do not need this file and continue
 # to use the pinned GitHub release channel below.
 UPDATER_ENV_FILE="${MUX_UPDATER_ENV_FILE:-/etc/5tratumos/5tratmux-updater.env}"
+orphaned_public_handoff_pin() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "${UPDATER_ENV_FILE}" "${MUX_OS_HANDOFF_MARKER:-/opt/5tratumos/bootstrap/5tratmux-post-update-required.json}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+feed, marker = map(Path, sys.argv[1:])
+try:
+    # A pending handoff (including a broken link) retains its exact release.
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        sys.exit(1)
+    if feed.is_symlink():
+        sys.exit(1)
+    with feed.open(encoding="utf-8") as stream:
+        body = stream.read(4097)
+    pattern = (r"# Managed by 5tratumOS update handoff\n"
+               r"MUX_MANIFEST_URL=(https://github\.com/WillItMod/5tratMux/releases/download/"
+               r"v[0-9]+\.[0-9]+\.[0-9]+/5tratmux-release\.json)\n"
+               r"MUX_SIGNATURE_URL=\1\.sig\n?")
+    sys.exit(0 if re.fullmatch(pattern, body) else 1)
+except (OSError, UnicodeError):
+    sys.exit(1)
+PY
+}
 if [[ -r "${UPDATER_ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${UPDATER_ENV_FILE}"
+  if orphaned_public_handoff_pin; then
+    printf 'Ignoring an orphaned OS handoff release pin; checking the public signed release channel.\n' >&2
+  else
+    # Private/operator feeds and active OS handoffs remain authoritative.
+    # shellcheck disable=SC1090
+    source "${UPDATER_ENV_FILE}"
+  fi
 fi
 
 PRODUCT="5tratMux"
@@ -15,6 +49,9 @@ CONTAINER_NAME="${MUX_CONTAINER_NAME:-5tratmux}"
 STATE_DIR="${MUX_STATE_DIR:-/var/lib/5tratumos/5tratmux}"
 CONFIG_DIR="${MUX_CONFIG_DIR:-/etc/5tratumos}"
 CONFIG_FILE="${MUX_CONFIG_FILE:-${CONFIG_DIR}/5tratmux.env}"
+DNS_CONFIG_FILE="${MUX_DNS_CONFIG_FILE:-${CONFIG_DIR}/5tratmux-dns.json}"
+LIFECYCLE_LOCK_FILE="${MUX_LIFECYCLE_LOCK_FILE:-/run/lock/5tratmux-lifecycle.lock}"
+DNS_OPERATION_FILE="${MUX_DNS_OPERATION_FILE:-/var/lib/5tratumos/mux-dns-apply.json}"
 CONTROLLER_TOKEN_FILE="${MUX_CONTROLLER_TOKEN_FILE:-${CONFIG_DIR}/5tratmux-controller.token}"
 RUNTIME_DIR="${MUX_RUNTIME_DIR:-/var/lib/5tratumos/5tratmux-updater}"
 STATUS_FILE="${MUX_STATUS_FILE:-${RUNTIME_DIR}/status.json}"
@@ -136,6 +173,38 @@ require_root() {
   [[ "$(id -u)" -eq 0 ]] || die "run this command with sudo"
 }
 
+with_lifecycle_lock() (
+  # Shared with OS-owned DNS changes. Do not overwrite another operation's
+  # status when it holds this lock, and do not retain it between watchdog polls.
+  require_root
+  command -v flock >/dev/null 2>&1 || die "required command is missing: flock"
+  umask 077
+  mkdir -p "$(dirname "${LIFECYCLE_LOCK_FILE}")"
+  exec 9>"${LIFECYCLE_LOCK_FILE}"
+  if ! flock --nonblock 9; then
+    printf '5tratMux: another update or DNS change is in progress; retry when it finishes.\n' >&2
+    exit 75
+  fi
+  if ! python3 - "${DNS_OPERATION_FILE}" <<'PY'
+import json
+import os
+import sys
+try:
+    if os.path.exists(sys.argv[1]):
+        with open(sys.argv[1], encoding="utf-8") as handle:
+            state = json.load(handle)
+        if not isinstance(state, dict) or state.get("applying") or state.get("rollback") == "requires_inspection":
+            raise ValueError("unfinished DNS change")
+except (OSError, ValueError, TypeError):
+    print("5tratMux: an unresolved DNS change needs attention before another update or restart.", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    exit 75
+  fi
+  "$@"
+)
+
 require_commands() {
   local command_name
   for command_name in curl docker openssl python3 sha256sum; do
@@ -224,6 +293,11 @@ download_manifest() {
     "${SIGNATURE_URL}" -o "${directory}/manifest.sig"; then
     die "the signed release signature is unavailable; the installed version was not changed"
   fi
+  verify_manifest "${directory}"
+}
+
+verify_manifest() {
+  local directory="$1"
   openssl pkeyutl \
     -verify \
     -pubin \
@@ -232,6 +306,17 @@ download_manifest() {
     -in "${directory}/manifest.json" \
     -sigfile "${directory}/manifest.sig" >/dev/null \
     || die "release manifest signature verification failed"
+}
+
+bundled_manifest() {
+  local source="$1" work="$2" name
+  for name in 5tratmux-release.json 5tratmux-release.json.sig; do
+    [[ -f "${source}/${name}" && ! -L "${source}/${name}" ]] \
+      || die "bundled release is missing a regular ${name}; the installed version was not changed"
+  done
+  cp "${source}/5tratmux-release.json" "${work}/manifest.json"
+  cp "${source}/5tratmux-release.json.sig" "${work}/manifest.sig"
+  verify_manifest "${work}"
 }
 
 manifest_value() {
@@ -375,6 +460,43 @@ PY
   chmod 0600 "${CONFIG_FILE}"
 }
 
+configured_dns_servers() {
+  # DNS is separate from the release-channel environment file so an OS/MUX
+  # update cannot discard the user's resolver choice. Never source this JSON.
+  python3 - "${DNS_CONFIG_FILE}" "${MUX_DNS_PRIMARY}" "${MUX_DNS_SECONDARY}" <<'PY'
+import ipaddress
+import json
+import os
+import sys
+
+try:
+    path, primary, secondary = sys.argv[1:]
+    servers = [primary, secondary]
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            settings = json.load(handle)
+        if not isinstance(settings, dict) or settings.get("mode") not in {"default", "custom"}:
+            raise ValueError("invalid mode")
+        servers = ["1.1.1.1", "8.8.8.8"] if settings["mode"] == "default" else settings.get("servers")
+    if not isinstance(servers, list) or not 1 <= len(servers) <= 3:
+        raise ValueError("invalid DNS server count")
+    result = []
+    for value in servers:
+        if not isinstance(value, str) or not value or value != value.strip() or "%" in value:
+            raise ValueError("invalid DNS address")
+        address = ipaddress.ip_address(value)
+        if address.is_unspecified or address.is_multicast or str(address) == "255.255.255.255":
+            raise ValueError("invalid DNS address")
+        normalized = str(address)
+        if normalized not in result:
+            result.append(normalized)
+    print("\n".join(result))
+except (ValueError, TypeError, OSError):
+    print("Invalid saved 5tratMux DNS settings; correct the DNS configuration before updating.", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 container_mounts() {
   local candidate destination
   while IFS='|' read -r candidate destination; do
@@ -393,7 +515,12 @@ EOF
 start_container() {
   local image="$1"
   local release_channel="$2"
-  local -a mounts=()
+  local dns_values
+  local -a mounts=() dns_args=()
+  dns_values="$(configured_dns_servers)" || return 1
+  while IFS= read -r line; do
+    dns_args+=(--dns "${line}")
+  done <<< "${dns_values}"
   while IFS= read -r line; do
     mounts+=("${line}")
   done < <(container_mounts)
@@ -401,8 +528,7 @@ start_container() {
     --detach \
     --name "${CONTAINER_NAME}" \
     --network host \
-    --dns "${MUX_DNS_PRIMARY}" \
-    --dns "${MUX_DNS_SECONDARY}" \
+    "${dns_args[@]}" \
     --restart unless-stopped \
     --read-only \
     --tmpfs "/tmp:rw,exec,nosuid,nodev,size=256m" \
@@ -431,20 +557,28 @@ wait_for_health() {
 }
 
 install_release() {
+  local bundle="${1:-}"
   require_root
   require_commands
   write_public_key
   ensure_config
+  configured_dns_servers >/dev/null || die "saved DNS settings are invalid; the installed version was not changed"
 
   local work arch version channel image url digest archive current_image backup_name
   local installed installed_key available_key
   work="$(mktemp -d)"
   trap 'rm -rf "${work:-}"' EXIT
   write_status "checking" "Verifying the signed release manifest" ""
-  download_manifest "${work}"
+  if [[ -n "${bundle}" ]]; then
+    bundled_manifest "${bundle}" "${work}"
+  else
+    download_manifest "${work}"
+  fi
   arch="$(architecture)"
   version="$(manifest_value "${work}/manifest.json" version)"
   channel="$(manifest_value "${work}/manifest.json" channel)"
+  [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] \
+    || die "signed release version is invalid"
   [[ "${channel}" = "MAIN" ]] \
     || die "signed public releases must declare the MAIN channel"
   installed="$(installed_version)"
@@ -471,9 +605,19 @@ install_release() {
   digest="$(manifest_value "${work}/manifest.json" "images.${arch}.sha256")"
   archive="${work}/5tratmux.oci.tar.gz"
 
-  write_status "downloading" "Downloading and verifying 5tratMux ${version} for ${arch}" "${version}"
-  printf 'Downloading 5tratMux %s for %s...\n' "${version}" "${arch}"
-  curl --fail --silent --show-error --location "${url}" -o "${archive}"
+  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || die "signed archive checksum is invalid"
+  if [[ -n "${bundle}" ]]; then
+    # Derive the filename from the verified version, never a manifest URL/path.
+    archive="${bundle}/5tratmux-${version}-${arch}.oci.tar.gz"
+    [[ -f "${archive}" && ! -L "${archive}" ]] \
+      || die "the bundled ${arch} archive is missing; the installed version was not changed"
+    write_status "installing" "Verifying bundled 5tratMux ${version} for ${arch}" "${version}"
+    printf 'Installing bundled 5tratMux %s for %s without a download...\n' "${version}" "${arch}"
+  else
+    write_status "downloading" "Downloading and verifying 5tratMux ${version} for ${arch}" "${version}"
+    printf 'Downloading 5tratMux %s for %s...\n' "${version}" "${arch}"
+    curl --fail --silent --show-error --location "${url}" -o "${archive}"
+  fi
   printf '%s  %s\n' "${digest}" "${archive}" | sha256sum --check --status \
     || die "OCI archive checksum verification failed"
   docker load --input "${archive}" >/dev/null
@@ -529,6 +673,7 @@ rollback_release() {
   docker image inspect 5tratmux:rollback >/dev/null 2>&1 \
     || die "no rollback image is available"
   ensure_config
+  configured_dns_servers >/dev/null || die "saved DNS settings are invalid; the installed version was not changed"
   local rollback_channel
   rollback_channel="$(
     docker image inspect \
@@ -697,7 +842,7 @@ watchdog_once() {
   fi
   if [[ -z "${container}" ]]; then
     watchdog_log "runtime is absent; starting signed bootstrap"
-    "$0" --bootstrap || return 1
+    bootstrap_release || return 1
     watchdog_wait_for_health
     return $?
   fi
@@ -715,7 +860,7 @@ watchdog_once() {
   fi
   watchdog_mark_reinstall
   watchdog_log "restart did not restore health; repairing from the signed release"
-  "$0" --install || return 1
+  install_release || return 1
   watchdog_wait_for_health
 }
 
@@ -726,20 +871,24 @@ watchdog_release() {
   (( WATCHDOG_INTERVAL >= 30 )) || WATCHDOG_INTERVAL=30
   watchdog_log "service monitor started with a ${WATCHDOG_INTERVAL}s interval"
   while true; do
-    watchdog_once || true
+    with_lifecycle_lock watchdog_once || true
     sleep "${WATCHDOG_INTERVAL}"
   done
 }
 
 case "${1:---check}" in
   --check) check_release ;;
-  --install|--update) install_release ;;
-  --bootstrap) bootstrap_release ;;
+  --install|--update) with_lifecycle_lock install_release ;;
+  --install-bundle)
+    [[ $# -eq 2 && -n "$2" && -d "$2" ]] || die "usage: --install-bundle DIRECTORY"
+    with_lifecycle_lock install_release "$2"
+    ;;
+  --bootstrap) with_lifecycle_lock bootstrap_release ;;
   --watchdog) watchdog_release ;;
-  --rollback) rollback_release ;;
+  --rollback) with_lifecycle_lock rollback_release ;;
   --status) status_release ;;
   --help|-h)
-    printf 'Usage: %s --check|--install|--bootstrap|--watchdog|--rollback|--status\n' "$0"
+    printf 'Usage: %s --check|--install|--install-bundle DIRECTORY|--bootstrap|--watchdog|--rollback|--status\n' "$0"
     ;;
   *) die "unknown option: $1" ;;
 esac
