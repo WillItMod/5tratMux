@@ -293,6 +293,11 @@ download_manifest() {
     "${SIGNATURE_URL}" -o "${directory}/manifest.sig"; then
     die "the signed release signature is unavailable; the installed version was not changed"
   fi
+  verify_manifest "${directory}"
+}
+
+verify_manifest() {
+  local directory="$1"
   openssl pkeyutl \
     -verify \
     -pubin \
@@ -301,6 +306,17 @@ download_manifest() {
     -in "${directory}/manifest.json" \
     -sigfile "${directory}/manifest.sig" >/dev/null \
     || die "release manifest signature verification failed"
+}
+
+bundled_manifest() {
+  local source="$1" work="$2" name
+  for name in 5tratmux-release.json 5tratmux-release.json.sig; do
+    [[ -f "${source}/${name}" && ! -L "${source}/${name}" ]] \
+      || die "bundled release is missing a regular ${name}; the installed version was not changed"
+  done
+  cp "${source}/5tratmux-release.json" "${work}/manifest.json"
+  cp "${source}/5tratmux-release.json.sig" "${work}/manifest.sig"
+  verify_manifest "${work}"
 }
 
 manifest_value() {
@@ -541,6 +557,7 @@ wait_for_health() {
 }
 
 install_release() {
+  local bundle="${1:-}"
   require_root
   require_commands
   write_public_key
@@ -552,10 +569,16 @@ install_release() {
   work="$(mktemp -d)"
   trap 'rm -rf "${work:-}"' EXIT
   write_status "checking" "Verifying the signed release manifest" ""
-  download_manifest "${work}"
+  if [[ -n "${bundle}" ]]; then
+    bundled_manifest "${bundle}" "${work}"
+  else
+    download_manifest "${work}"
+  fi
   arch="$(architecture)"
   version="$(manifest_value "${work}/manifest.json" version)"
   channel="$(manifest_value "${work}/manifest.json" channel)"
+  [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] \
+    || die "signed release version is invalid"
   [[ "${channel}" = "MAIN" ]] \
     || die "signed public releases must declare the MAIN channel"
   installed="$(installed_version)"
@@ -582,9 +605,19 @@ install_release() {
   digest="$(manifest_value "${work}/manifest.json" "images.${arch}.sha256")"
   archive="${work}/5tratmux.oci.tar.gz"
 
-  write_status "downloading" "Downloading and verifying 5tratMux ${version} for ${arch}" "${version}"
-  printf 'Downloading 5tratMux %s for %s...\n' "${version}" "${arch}"
-  curl --fail --silent --show-error --location "${url}" -o "${archive}"
+  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || die "signed archive checksum is invalid"
+  if [[ -n "${bundle}" ]]; then
+    # Derive the filename from the verified version, never a manifest URL/path.
+    archive="${bundle}/5tratmux-${version}-${arch}.oci.tar.gz"
+    [[ -f "${archive}" && ! -L "${archive}" ]] \
+      || die "the bundled ${arch} archive is missing; the installed version was not changed"
+    write_status "installing" "Verifying bundled 5tratMux ${version} for ${arch}" "${version}"
+    printf 'Installing bundled 5tratMux %s for %s without a download...\n' "${version}" "${arch}"
+  else
+    write_status "downloading" "Downloading and verifying 5tratMux ${version} for ${arch}" "${version}"
+    printf 'Downloading 5tratMux %s for %s...\n' "${version}" "${arch}"
+    curl --fail --silent --show-error --location "${url}" -o "${archive}"
+  fi
   printf '%s  %s\n' "${digest}" "${archive}" | sha256sum --check --status \
     || die "OCI archive checksum verification failed"
   docker load --input "${archive}" >/dev/null
@@ -846,12 +879,16 @@ watchdog_release() {
 case "${1:---check}" in
   --check) check_release ;;
   --install|--update) with_lifecycle_lock install_release ;;
+  --install-bundle)
+    [[ $# -eq 2 && -n "$2" && -d "$2" ]] || die "usage: --install-bundle DIRECTORY"
+    with_lifecycle_lock install_release "$2"
+    ;;
   --bootstrap) with_lifecycle_lock bootstrap_release ;;
   --watchdog) watchdog_release ;;
   --rollback) with_lifecycle_lock rollback_release ;;
   --status) status_release ;;
   --help|-h)
-    printf 'Usage: %s --check|--install|--bootstrap|--watchdog|--rollback|--status\n' "$0"
+    printf 'Usage: %s --check|--install|--install-bundle DIRECTORY|--bootstrap|--watchdog|--rollback|--status\n' "$0"
     ;;
   *) die "unknown option: $1" ;;
 esac

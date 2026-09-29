@@ -16,6 +16,13 @@ Release containers carry a native compiled runtime and minified browser assets.
 
 ## Installation and updates
 
+OS updates that include a native MUX bundle install MUX from those local files.
+The updater verifies the signed manifest and archive checksum before replacing
+the running application, and restores the previous container if its health check
+fails. This bundled installation needs no additional release download or DNS
+lookup after the OS package arrives. Existing settings and saved DNS choices
+are preserved.
+
 5tratMux is bundled into supported 5tratumOS releases. Its own signed updater
 allows later Mux releases to be installed without waiting for a complete OS
 update:
