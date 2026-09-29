@@ -5,9 +5,43 @@ set -Eeuo pipefail
 # validation channel. Public installations do not need this file and continue
 # to use the pinned GitHub release channel below.
 UPDATER_ENV_FILE="${MUX_UPDATER_ENV_FILE:-/etc/5tratumos/5tratmux-updater.env}"
+orphaned_public_handoff_pin() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "${UPDATER_ENV_FILE}" "${MUX_OS_HANDOFF_MARKER:-/opt/5tratumos/bootstrap/5tratmux-post-update-required.json}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+feed, marker = map(Path, sys.argv[1:])
+try:
+    # A pending handoff (including a broken link) retains its exact release.
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        sys.exit(1)
+    if feed.is_symlink():
+        sys.exit(1)
+    with feed.open(encoding="utf-8") as stream:
+        body = stream.read(4097)
+    pattern = (r"# Managed by 5tratumOS update handoff\n"
+               r"MUX_MANIFEST_URL=(https://github\.com/WillItMod/5tratMux/releases/download/"
+               r"v[0-9]+\.[0-9]+\.[0-9]+/5tratmux-release\.json)\n"
+               r"MUX_SIGNATURE_URL=\1\.sig\n?")
+    sys.exit(0 if re.fullmatch(pattern, body) else 1)
+except (OSError, UnicodeError):
+    sys.exit(1)
+PY
+}
 if [[ -r "${UPDATER_ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${UPDATER_ENV_FILE}"
+  if orphaned_public_handoff_pin; then
+    printf 'Ignoring an orphaned OS handoff release pin; checking the public signed release channel.\n' >&2
+  else
+    # Private/operator feeds and active OS handoffs remain authoritative.
+    # shellcheck disable=SC1090
+    source "${UPDATER_ENV_FILE}"
+  fi
 fi
 
 PRODUCT="5tratMux"
