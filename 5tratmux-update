@@ -89,18 +89,19 @@ write_status() {
   local phase="${1:-idle}"
   local message="${2:-}"
   local version="${3:-}"
+  local power="${4:-}"
   if ! command -v python3 >/dev/null 2>&1; then
     return 0
   fi
-  install -d -m 0755 "${RUNTIME_DIR}" 2>/dev/null || true
-  python3 - "${STATUS_FILE}" "${phase}" "${message}" "${version}" <<'PY' 2>/dev/null || true
+  install -d -m 0755 "${RUNTIME_DIR}" || return 1
+  python3 - "${STATUS_FILE}" "${phase}" "${message}" "${version}" "${power}" "${MUX_UPDATE_OPERATION_ID:-}" "${MUX_UPDATE_RESULT_FILE:-${RUNTIME_DIR}/os-update-status.json}" <<'PY'
 import json
 import os
 import sys
 import tempfile
 from datetime import datetime, timezone
 
-path, phase, message, version = sys.argv[1:]
+path, phase, message, version, power, operation_id, result_path = sys.argv[1:]
 payload = {
     "phase": phase,
     "message": message,
@@ -109,20 +110,41 @@ payload = {
     "busy": phase in {"checking", "downloading", "installing", "rolling_back"},
 }
 
-directory = os.path.dirname(path)
-os.makedirs(directory, mode=0o755, exist_ok=True)
-fd, temporary = tempfile.mkstemp(prefix=".5tratmux-update-", dir=directory)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(temporary, 0o644)
-    os.replace(temporary, path)
-finally:
-    if os.path.exists(temporary):
-        os.unlink(temporary)
+if operation_id:
+    import re
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise ValueError("invalid update operation ID")
+    payload["operationId"] = operation_id
+if power:
+    payload["power"] = json.loads(power)
+
+def atomic_write(destination):
+    directory = os.path.dirname(destination)
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".5tratmux-update-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, destination)
+        parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+atomic_write(path)
+# A later watchdog/bootstrap invocation must not overwrite the OS operation's
+# result. One fixed receipt is replaced only by an explicitly identified run.
+if operation_id:
+    atomic_write(result_path)
+
 PY
 }
 
@@ -141,17 +163,58 @@ raise SystemExit(0 if desired != "off" else 1)
 PY
 }
 
+power_off_error() {
+  write_status "failed" "$1" "" || true
+  printf '5tratMux updater: %s\n' "$1" >&2
+  return 1
+}
+
 hold_powered_off() {
-  local installed
+  local installed observed proof names
   installed="$(installed_version)"
   if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-    docker update --restart=no "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-    docker stop --time 20 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker update --restart=no "${CONTAINER_NAME}" >/dev/null \
+      || { power_off_error "could not preserve the powered-off restart policy"; return 1; }
+    docker stop --time 20 "${CONTAINER_NAME}" >/dev/null \
+      || { power_off_error "could not stop 5tratMux while preserving power Off"; return 1; }
+    observed="$(docker container inspect --format '{{json .}}' "${CONTAINER_NAME}")" \
+      || { power_off_error "could not verify the powered-off container"; return 1; }
+    proof="$(python3 - "${observed}" "${CONTAINER_NAME}" <<'PYOFF'
+import json, re, sys
+value = json.loads(sys.argv[1])
+state = value.get("State") or {}
+identity, image = value.get("Id"), value.get("Image")
+policy = (value.get("HostConfig") or {}).get("RestartPolicy") or {}
+assert re.fullmatch(r"[0-9a-f]{64}", identity or "")
+assert re.fullmatch(r"sha256:[0-9a-f]{64}", image or "")
+assert state.get("Running") is False and state.get("Restarting") is False
+assert state.get("Paused") is False and state.get("Dead") is False
+assert state.get("Status") in {"created", "exited"} and policy.get("Name") == "no"
+print(json.dumps({"desired":"off", "verified":True, "containerPresent":True,
+                  "containerName":sys.argv[2], "containerId":identity, "imageId":image, "running":False,
+                  "restartPolicy":"no"}, separators=(",", ":")))
+PYOFF
+)" || { power_off_error "powered-off container state could not be verified"; return 1; }
+  else
+    # An inspect error alone does not establish absence (the daemon may be down).
+    names="$(docker container ls --all --format '{{.Names}}')" \
+      || { power_off_error "could not verify that the powered-off container is absent"; return 1; }
+    if printf '%s\n' "${names}" | grep -Fxq "${CONTAINER_NAME}"; then
+      power_off_error "could not inspect the existing powered-off container"; return 1
+    fi
+    proof="$(python3 - "${CONTAINER_NAME}" <<'PYABSENT'
+import json, sys
+print(json.dumps({"desired":"off", "verified":True, "containerPresent":False,
+                  "containerName":sys.argv[1], "containerId":None, "imageId":None,
+                  "running":False, "restartPolicy":None}, separators=(",", ":")))
+PYABSENT
+)" || { power_off_error "could not record the absent powered-off container"; return 1; }
   fi
+  [[ "${1:-}" != "verify-only" ]] || return 0
   write_status \
     "powered_off" \
     "5tratMux is powered off by 5tratumOS; settings, licence and saved routes are preserved" \
-    "${installed}"
+    "${installed}" "${proof}"
 }
 
 enable_watchdog_service() {
@@ -164,7 +227,7 @@ enable_watchdog_service() {
 }
 
 die() {
-  write_status "failed" "$*" ""
+  write_status "failed" "$*" "" || true
   printf '5tratMux updater: %s\n' "$*" >&2
   exit 1
 }
@@ -525,9 +588,12 @@ container_mounts() {
 EOF
 }
 
-start_container() {
+container_from_image() {
   local image="$1"
   local release_channel="$2"
+  local action="$3" restart="$4"
+  local -a action_args=("${action}")
+  [[ "$action" != "run" ]] || action_args+=(--detach)
   local dns_values
   local -a mounts=() dns_args=()
   dns_values="$(configured_dns_servers)" || return 1
@@ -537,12 +603,11 @@ start_container() {
   while IFS= read -r line; do
     mounts+=("${line}")
   done < <(container_mounts)
-  docker run \
-    --detach \
+  docker "${action_args[@]}" \
     --name "${CONTAINER_NAME}" \
     --network host \
     "${dns_args[@]}" \
-    --restart unless-stopped \
+    --restart "${restart}" \
     --read-only \
     --tmpfs "/tmp:rw,exec,nosuid,nodev,size=256m" \
     --pids-limit 256 \
@@ -553,6 +618,17 @@ start_container() {
     --mount "type=bind,src=${STATE_DIR},dst=/data/ui/state" \
     "${mounts[@]}" \
     "${image}" >/dev/null
+}
+
+start_container() { container_from_image "$1" "$2" run unless-stopped; }
+create_stopped_container() { container_from_image "$1" "$2" create no; }
+
+activate_release() {
+  if power_desired_on; then
+    start_container "$1" "$2" && wait_for_health
+  else
+    create_stopped_container "$1" "$2" && hold_powered_off verify-only
+  fi
 }
 
 wait_for_health() {
@@ -607,7 +683,7 @@ install_release() {
         "Installed 5tratMux ${installed} is not older than signed release ${version}; no downgrade was performed" \
         "${installed}"
     else
-      hold_powered_off
+      hold_powered_off || return 1
     fi
     enable_watchdog_service
     printf '5tratMux %s was preserved; signed release %s is not newer.\n' "${installed}" "${version}"
@@ -633,7 +709,7 @@ install_release() {
   fi
   printf '%s  %s\n' "${digest}" "${archive}" | sha256sum --check --status \
     || die "OCI archive checksum verification failed"
-  docker load --input "${archive}" >/dev/null
+  docker load --input "${archive}" >/dev/null || die "verified archive could not be loaded"
   docker image inspect "${image}" >/dev/null \
     || die "verified archive did not contain ${image}"
 
@@ -643,21 +719,43 @@ install_release() {
     current_image="$(
       docker container inspect --format '{{.Image}}' "${CONTAINER_NAME}"
     )"
-    docker image tag "${current_image}" 5tratmux:rollback
-    docker stop "${CONTAINER_NAME}" >/dev/null
+    docker image tag "${current_image}" 5tratmux:rollback \
+      || die "could not retain the current image for rollback"
+    docker stop "${CONTAINER_NAME}" >/dev/null \
+      || die "could not stop the previous container; installation was not applied"
     backup_name="${CONTAINER_NAME}-previous-$(date +%s)"
-    docker rename "${CONTAINER_NAME}" "${backup_name}"
+    docker rename "${CONTAINER_NAME}" "${backup_name}" \
+      || die "could not preserve the previous container for restoration"
   else
     backup_name=""
   fi
 
-  if ! start_container "${image}" "${channel}" || ! wait_for_health; then
-    docker container rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-    if [[ -n "${backup_name}" ]]; then
-      docker rename "${backup_name}" "${CONTAINER_NAME}"
-      docker start "${CONTAINER_NAME}" >/dev/null
+  if ! activate_release "${image}" "${channel}"; then
+    if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+      docker container rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 \
+        || die "new release failed; could not remove its container for restoration"
+    else
+      local remaining
+      remaining="$(docker container ls --all --format '{{.Names}}')" \
+        || die "new release failed; could not check container state before restoration"
+      if printf '%s\n' "${remaining}" | grep -Fxq "${CONTAINER_NAME}"; then
+        die "new release failed; could not inspect its container before restoration"
+      fi
     fi
-    die "new release failed its health check; the previous release was restored"
+    if [[ -n "${backup_name}" ]]; then
+      docker rename "${backup_name}" "${CONTAINER_NAME}" \
+        || die "new release failed; could not restore the previous container name"
+      if power_desired_on; then
+        docker start "${CONTAINER_NAME}" >/dev/null \
+          || die "new release failed; previous container could not be started"
+      else
+        hold_powered_off verify-only || return 1
+      fi
+    fi
+    if [[ -n "${backup_name}" ]]; then
+      die "new release failed its runtime verification; the previous release was restored without changing desired power"
+    fi
+    die "new release failed its runtime verification; no previous container was available to restore"
   fi
 
   if [[ -n "${backup_name}" ]]; then
@@ -673,10 +771,10 @@ install_release() {
   if power_desired_on; then
     write_status "healthy" "5tratMux ${version} is healthy; licence and trial state were unchanged" "${version}"
   else
-    hold_powered_off
+    hold_powered_off || return 1
   fi
   enable_watchdog_service
-  printf '5tratMux %s is healthy. Trial status was not changed.\n' "${version}"
+  printf '5tratMux %s installation verified; desired power was preserved. Trial status was not changed.\n' "${version}"
 }
 
 rollback_release() {
@@ -697,14 +795,14 @@ rollback_release() {
   if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
     docker container rm --force "${CONTAINER_NAME}" >/dev/null
   fi
-  start_container 5tratmux:rollback "${rollback_channel}"
-  wait_for_health || die "rollback image did not become healthy"
+  activate_release 5tratmux:rollback "${rollback_channel}" \
+    || die "rollback image failed runtime verification"
   if power_desired_on; then
     write_status "healthy" "The previous verified 5tratMux release is healthy" "$(installed_version)"
   else
-    hold_powered_off
+    hold_powered_off || return 1
   fi
-  printf '5tratMux rollback image is healthy.\n'
+  printf '5tratMux rollback verified; desired power was preserved.\n'
 }
 
 check_release() {
@@ -747,7 +845,7 @@ bootstrap_release() {
   local installed
   installed="$(installed_version)"
   if ! power_desired_on; then
-    hold_powered_off
+    hold_powered_off || return 1
     printf '5tratMux remains powered off. Settings, licence and saved routes were preserved.\n'
     return 0
   fi
@@ -831,12 +929,7 @@ watchdog_mark_reinstall() {
 
 watchdog_once() {
   if ! power_desired_on; then
-    if [[ "$(
-      docker container inspect --format '{{.State.Running}}' \
-        "${CONTAINER_NAME}" 2>/dev/null || true
-    )" = "true" ]]; then
-      hold_powered_off
-    fi
+    hold_powered_off || return 1
     return 0
   fi
   health_ready && return 0
