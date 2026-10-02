@@ -37,8 +37,13 @@ sudo /tmp/5tratmux-update --install
 
 The updater verifies the signed release manifest and the SHA-256 digest of the
 architecture-specific OCI archive before Docker loads it. It preserves local
-state, installation identity and licence data, performs a health check, and
-automatically restores the previous image if startup fails.
+state, installation identity and licence data. When power is On, it performs a
+health check and restores the previous container if startup fails. When power
+is Off, it creates the verified image as a stopped container with automatic
+restart disabled, without temporarily starting Mux or probing its HTTP service.
+Updates, rollback and failure recovery preserve that saved Off choice; a stop
+or verification failure remains an error. OS handoffs receive a separate,
+operation-bound result that later bootstrap or watchdog checks cannot overwrite.
 
 Installing or updating 5tratMux does not start the trial. An eligible
 168-hour preview starts only after the user explicitly selects
