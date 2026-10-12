@@ -102,7 +102,7 @@ with_lifecycle_lock watchdog_once
                 holder.communicate('release\n',timeout=5)
                 out,err=installer.communicate(timeout=10)
                 self.assertEqual(installer.returncode,0,err)
-                self.assertIn('load --input '+str(self.archive),(self.root/'docker.log').read_text())
+                self.assertIn('load --input ',(self.root/'docker.log').read_text())
                 self.assertFalse((self.root/'network.log').exists())
                 self.assertEqual(json.loads(status.read_text())['phase'],'healthy')
             finally:
@@ -149,16 +149,24 @@ with_lifecycle_lock watchdog_once
                 self.assertEqual(result.returncode,2,result.stderr)
                 self.assertFalse((self.root/'docker.log').exists())
 
+    def docker_mutations(self):
+        # Read-only container queries (interrupted-install detection) are allowed.
+        log=self.root/'docker.log'
+        lines=log.read_text().splitlines() if log.exists() else []
+        return [l for l in lines if not l.startswith(('container inspect ','container ls '))]
+
     def assert_untouched(self, result):
         self.assertNotEqual(result.returncode,0)
-        self.assertFalse((self.root/'docker.log').exists())
+        self.assertEqual(self.docker_mutations(),[])
         self.assertFalse((self.root/'network.log').exists())
 
     def test_install_uses_only_signed_local_archive(self):
         result=self.run_install()
         self.assertEqual(result.returncode,0,result.stderr)
         log=(self.root/'docker.log').read_text()
-        self.assertIn('load --input '+str(self.archive),log)
+        # The verified bytes are loaded from a private copy, not the bundle path.
+        self.assertIn('load --input ',log)
+        self.assertNotIn('load --input '+str(self.archive),log)
         self.assertIn('stop bundle-test',log)
         self.assertFalse((self.root/'network.log').exists())
         self.assertEqual((self.root/'installed-version').read_text().strip(),'0.9.59')
@@ -198,7 +206,7 @@ with_lifecycle_lock watchdog_once
     def test_newer_installed_version_is_preserved(self):
         result=self.run_install(installed='0.9.60')
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertFalse((self.root/'docker.log').exists())
+        self.assertEqual(self.docker_mutations(),[])
         self.assertFalse((self.root/'network.log').exists())
 
 if __name__=='__main__': unittest.main()

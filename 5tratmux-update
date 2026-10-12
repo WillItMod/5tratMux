@@ -44,6 +44,7 @@ if [[ -r "${UPDATER_ENV_FILE}" ]]; then
   fi
 fi
 
+# shellcheck disable=SC2034  # descriptive constant retained for operators
 PRODUCT="5tratMux"
 CONTAINER_NAME="${MUX_CONTAINER_NAME:-5tratmux}"
 STATE_DIR="${MUX_STATE_DIR:-/var/lib/5tratumos/5tratmux}"
@@ -66,6 +67,18 @@ MUX_DNS_SECONDARY="${MUX_DNS_SECONDARY:-8.8.8.8}"
 LICENSING_PUBLIC_KEY="I_aujMd069Ki6ZYDw-qhQDQWM0JX5ymizbg7pqVakkE"
 HEALTH_URL="${MUX_HEALTH_URL:-http://127.0.0.1:21222/api/health}"
 HEALTH_ATTEMPTS="${MUX_HEALTH_ATTEMPTS:-120}"
+# Overall bound for one post-install health wait, independent of probe count.
+HEALTH_DEADLINE_SECONDS="${MUX_HEALTH_DEADLINE_SECONDS:-300}"
+# Every network request is bounded so a stalled peer cannot hold the
+# lifecycle lock (and the busy status) indefinitely.
+CURL_CONNECT_TIMEOUT="${MUX_CURL_CONNECT_TIMEOUT:-15}"
+MANIFEST_MAX_TIME="${MUX_MANIFEST_MAX_TIME:-60}"
+DOWNLOAD_MAX_TIME="${MUX_DOWNLOAD_MAX_TIME:-1800}"
+HIGHEST_VERSION_FILE="${RUNTIME_DIR}/highest-installed-version"
+# Set only by the explicit --allow-downgrade CLI flag.
+ALLOW_DOWNGRADE=0
+UPDATER_WORK_DIR=""
+UPDATER_STATUS_BUSY=0
 WATCHDOG_STATE_DIR="${MUX_WATCHDOG_STATE_DIR:-/var/lib/5tratumos/5tratmux-watchdog}"
 WATCHDOG_INTERVAL="${MUX_WATCHDOG_INTERVAL:-120}"
 WATCHDOG_REINSTALL_COOLDOWN="${MUX_WATCHDOG_REINSTALL_COOLDOWN:-3600}"
@@ -90,6 +103,14 @@ write_status() {
   local message="${2:-}"
   local version="${3:-}"
   local power="${4:-}"
+  case "${phase}" in
+    checking|downloading|installing|rolling_back)
+      UPDATER_STATUS_BUSY=1
+      # Any exit while busy (set -e failure, signal) must clear the busy flag.
+      trap updater_exit_trap EXIT
+      ;;
+    *) UPDATER_STATUS_BUSY=0 ;;
+  esac
   if ! command -v python3 >/dev/null 2>&1; then
     return 0
   fi
@@ -146,6 +167,34 @@ if operation_id:
     atomic_write(result_path)
 
 PY
+}
+
+updater_exit_trap() {
+  local rc=$?
+  if [[ -n "${UPDATER_WORK_DIR}" ]]; then
+    rm -rf -- "${UPDATER_WORK_DIR}" || true
+    UPDATER_WORK_DIR=""
+  fi
+  # A die() inside a command substitution already recorded its own failure;
+  # only replace a status that still claims this run is busy.
+  if (( rc != 0 )) && [[ "${UPDATER_STATUS_BUSY}" = 1 ]] && updater_busy; then
+    write_status "failed" "The 5tratMux updater stopped before finishing (exit ${rc}); check 5tratMux status and retry" "" || true
+  fi
+  return "${rc}"
+}
+
+new_work_dir() {
+  cleanup_work_dir
+  # mktemp -d creates a private (0700) directory owned by the caller.
+  UPDATER_WORK_DIR="$(mktemp -d)"
+  trap updater_exit_trap EXIT
+}
+
+cleanup_work_dir() {
+  if [[ -n "${UPDATER_WORK_DIR}" ]]; then
+    rm -rf -- "${UPDATER_WORK_DIR}"
+    UPDATER_WORK_DIR=""
+  fi
 }
 
 power_desired_on() {
@@ -347,6 +396,7 @@ download_manifest() {
   local manifest_status installed
   if ! manifest_status="$(
     curl --silent --show-error --location \
+      --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${MANIFEST_MAX_TIME}" \
       --output "${directory}/manifest.json" \
       --write-out '%{http_code}' \
       "${MANIFEST_URL}"
@@ -366,6 +416,7 @@ download_manifest() {
   [[ "${manifest_status}" =~ ^2[0-9][0-9]$ ]] \
     || die "the signed release channel returned HTTP ${manifest_status}; the installed version was not changed"
   if ! curl --fail --silent --show-error --location \
+    --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${MANIFEST_MAX_TIME}" \
     "${SIGNATURE_URL}" -o "${directory}/manifest.sig"; then
     die "the signed release signature is unavailable; the installed version was not changed"
   fi
@@ -463,26 +514,41 @@ detect_host_ip() {
 }
 
 refresh_public_host_config() {
+  # Refresh the advertised host and migrate older generated configs: the MUX
+  # HTTP API binds to loopback (5tratumOS proxies authenticated LAN access)
+  # unless the operator explicitly opted in with MUX_HTTP_ALLOW_LAN=1, and the
+  # pinned licensing key is added when missing. Other lines are preserved.
   local host_ip="$1"
-  [[ -n "${host_ip}" ]] || return 0
-  python3 - "${CONFIG_FILE}" "${host_ip}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${host_ip}" "${LICENSING_PUBLIC_KEY}" <<'PY'
 import os
 import sys
 import tempfile
 
-path, host_ip = sys.argv[1:]
+path, host_ip, licensing_key = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as handle:
-    lines = handle.read().splitlines()
+    original = handle.read()
+lines = original.splitlines()
+allow_lan = any(line.strip() == "MUX_HTTP_ALLOW_LAN=1" for line in lines)
 updated = []
 found = False
+has_licensing_key = False
 for line in lines:
-    if line.startswith("APP_PUBLIC_HOST="):
+    if host_ip and line.startswith("APP_PUBLIC_HOST="):
         updated.append(f"APP_PUBLIC_HOST={host_ip}")
         found = True
+    elif not allow_lan and line.strip() in {"APP_HOST=0.0.0.0", "APP_HOST=::", "APP_HOST=[::]"}:
+        updated.append("APP_HOST=127.0.0.1")
     else:
+        if line.startswith("MUX_LICENSING_PUBLIC_KEY=") and line.split("=", 1)[1].strip():
+            has_licensing_key = True
         updated.append(line)
-if not found:
+if host_ip and not found:
     updated.append(f"APP_PUBLIC_HOST={host_ip}")
+if not has_licensing_key:
+    updated = [line for line in updated if not line.startswith("MUX_LICENSING_PUBLIC_KEY=")]
+    updated.append(f"MUX_LICENSING_PUBLIC_KEY={licensing_key}")
+if "\n".join(updated) + "\n" == original:
+    sys.exit(0)
 directory = os.path.dirname(path) or "."
 fd, temporary = tempfile.mkstemp(prefix=".5tratmux-env-", dir=directory)
 try:
@@ -525,7 +591,8 @@ PY
   fi
   host_ip="${host_ip:-127.0.0.1}"
   {
-    printf 'APP_HOST=0.0.0.0\n'
+    # Loopback only: 5tratumOS exposes the UI through its authenticated proxy.
+    printf 'APP_HOST=127.0.0.1\n'
     printf 'APP_PORT=21222\n'
     printf 'APP_CHANNEL=MAIN\n'
     printf 'APP_PUBLIC_HOST=%s\n' "${host_ip}"
@@ -632,17 +699,113 @@ activate_release() {
 }
 
 wait_for_health() {
-  local attempt
+  local attempt deadline
   if [[ ! "${HEALTH_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
     HEALTH_ATTEMPTS=120
   fi
+  if [[ ! "${HEALTH_DEADLINE_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    HEALTH_DEADLINE_SECONDS=300
+  fi
+  deadline=$((SECONDS + HEALTH_DEADLINE_SECONDS))
   for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-    if curl --fail --silent --show-error "${HEALTH_URL}" >/dev/null 2>&1; then
+    if curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+      "${HEALTH_URL}" >/dev/null 2>&1; then
       return 0
     fi
+    (( SECONDS < deadline )) || return 1
     sleep 1
   done
   return 1
+}
+
+# The highest release this device has run. Older signed manifests are refused
+# even when the container is missing or unlabelled, unless the operator passes
+# --allow-downgrade (an explicit --rollback uses the retained local image).
+recorded_version_floor() {
+  local file value best="" best_key="" key
+  for file in "${HIGHEST_VERSION_FILE}" "${RUNTIME_DIR}/installed-version"; do
+    [[ -f "${file}" && ! -L "${file}" ]] || continue
+    value="$(head -n 1 "${file}" 2>/dev/null || true)"
+    [[ "${value}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || continue
+    key="$(version_key "${value}")"
+    if [[ -z "${best}" || "${key}" > "${best_key}" ]]; then
+      best="${value}"
+      best_key="${key}"
+    fi
+  done
+  printf '%s\n' "${best}"
+}
+
+record_installed_version() {
+  local version="$1" floor
+  install -d -m 0755 "${RUNTIME_DIR}"
+  printf '%s\n' "${version}" > "${RUNTIME_DIR}/installed-version"
+  floor="$(recorded_version_floor)"
+  if [[ "${ALLOW_DOWNGRADE}" = 1 || -z "${floor}" ]] \
+    || [[ "$(version_key "${version}")" > "$(version_key "${floor}")" ]]; then
+    floor="${version}"
+  fi
+  printf '%s\n' "${floor}" > "${HIGHEST_VERSION_FILE}.tmp"
+  mv -f "${HIGHEST_VERSION_FILE}.tmp" "${HIGHEST_VERSION_FILE}"
+}
+
+# Containers set aside by an install/rollback that was interrupted (power loss,
+# SIGKILL) before the replacement became current. Newest name sorts last.
+previous_containers() {
+  local name prefix="${CONTAINER_NAME}-previous-"
+  while IFS= read -r name; do
+    [[ "${name}" == "${prefix}"* && "${name#"${prefix}"}" =~ ^[0-9]+$ ]] || continue
+    printf '%s %s\n' "${name#"${prefix}"}" "${name}"
+  done | sort -n | awk '{print $2}'
+}
+
+restore_interrupted_install() {
+  local names newest
+  if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    return 0
+  fi
+  # An inspect error alone does not establish absence (the daemon may be down).
+  names="$(docker container ls --all --format '{{.Names}}')" \
+    || die "could not list containers to check for an interrupted update"
+  if printf '%s\n' "${names}" | grep -Fxq "${CONTAINER_NAME}"; then
+    die "could not inspect the existing 5tratMux container"
+  fi
+  newest="$(printf '%s\n' "${names}" | previous_containers | tail -n 1)"
+  [[ -n "${newest}" ]] || return 0
+  printf 'Restoring %s left by an interrupted 5tratMux update.\n' "${newest}" >&2
+  docker rename "${newest}" "${CONTAINER_NAME}" \
+    || die "could not restore ${newest} left by an interrupted update"
+  if power_desired_on; then
+    docker update --restart=unless-stopped "${CONTAINER_NAME}" >/dev/null \
+      || die "could not restore the restart policy of the recovered container"
+    docker start "${CONTAINER_NAME}" >/dev/null \
+      || die "the container recovered from an interrupted update could not be started"
+  fi
+}
+
+# Undo a failed replacement: remove the new container and restore the one set
+# aside as ${backup_name}, preserving the desired power state.
+restore_previous_container() {
+  local backup_name="$1" label="$2" remaining
+  if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    docker container rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 \
+      || die "${label} failed; could not remove its container for restoration"
+  else
+    remaining="$(docker container ls --all --format '{{.Names}}')" \
+      || die "${label} failed; could not check container state before restoration"
+    if printf '%s\n' "${remaining}" | grep -Fxq "${CONTAINER_NAME}"; then
+      die "${label} failed; could not inspect its container before restoration"
+    fi
+  fi
+  [[ -n "${backup_name}" ]] || return 0
+  docker rename "${backup_name}" "${CONTAINER_NAME}" \
+    || die "${label} failed; could not restore the previous container name"
+  if power_desired_on; then
+    docker start "${CONTAINER_NAME}" >/dev/null \
+      || die "${label} failed; previous container could not be started"
+  else
+    hold_powered_off verify-only || return 1
+  fi
 }
 
 install_release() {
@@ -652,11 +815,14 @@ install_release() {
   write_public_key
   ensure_config
   configured_dns_servers >/dev/null || die "saved DNS settings are invalid; the installed version was not changed"
+  # A previous run interrupted between setting the old container aside and
+  # activating its replacement must be repaired before anything is fetched.
+  restore_interrupted_install
 
   local work arch version channel image url digest archive current_image backup_name
-  local installed installed_key available_key
-  work="$(mktemp -d)"
-  trap 'rm -rf "${work:-}"' EXIT
+  local installed installed_key available_key floor
+  new_work_dir
+  work="${UPDATER_WORK_DIR}"
   write_status "checking" "Verifying the signed release manifest" ""
   if [[ -n "${bundle}" ]]; then
     bundled_manifest "${bundle}" "${work}"
@@ -674,8 +840,8 @@ install_release() {
   installed_key="$(version_key "${installed}")"
   available_key="$(version_key "${version}")"
   if [[ -n "${installed}" && (
-    "${installed_key}" > "${available_key}"
-    || "${installed_key}" = "${available_key}"
+    "${installed_key}" = "${available_key}"
+    || ( "${installed_key}" > "${available_key}" && "${ALLOW_DOWNGRADE}" != 1 )
   ) ]]; then
     if power_desired_on; then
       write_status \
@@ -686,8 +852,16 @@ install_release() {
       hold_powered_off || return 1
     fi
     enable_watchdog_service
+    cleanup_work_dir
     printf '5tratMux %s was preserved; signed release %s is not newer.\n' "${installed}" "${version}"
     return 0
+  fi
+  # The container may be missing or unlabelled; the recorded floor still
+  # prevents a replayed older signed manifest from being installed.
+  floor="$(recorded_version_floor)"
+  if [[ "${ALLOW_DOWNGRADE}" != 1 && -n "${floor}" ]] \
+    && [[ "$(version_key "${floor}")" > "${available_key}" ]]; then
+    die "signed release ${version} is older than previously installed 5tratMux ${floor}; refusing the downgrade (use --allow-downgrade or --rollback deliberately)"
   fi
   image="$(manifest_value "${work}/manifest.json" "images.${arch}.image")"
   url="$(manifest_value "${work}/manifest.json" "images.${arch}.url")"
@@ -697,15 +871,21 @@ install_release() {
   [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || die "signed archive checksum is invalid"
   if [[ -n "${bundle}" ]]; then
     # Derive the filename from the verified version, never a manifest URL/path.
-    archive="${bundle}/5tratmux-${version}-${arch}.oci.tar.gz"
-    [[ -f "${archive}" && ! -L "${archive}" ]] \
+    local bundled_archive="${bundle}/5tratmux-${version}-${arch}.oci.tar.gz"
+    [[ -f "${bundled_archive}" && ! -L "${bundled_archive}" ]] \
       || die "the bundled ${arch} archive is missing; the installed version was not changed"
     write_status "installing" "Verifying bundled 5tratMux ${version} for ${arch}" "${version}"
     printf 'Installing bundled 5tratMux %s for %s without a download...\n' "${version}" "${arch}"
+    # Hash and load one private copy so the bundle cannot change in between.
+    cp -- "${bundled_archive}" "${archive}" \
+      || die "the bundled ${arch} archive could not be copied; the installed version was not changed"
   else
     write_status "downloading" "Downloading and verifying 5tratMux ${version} for ${arch}" "${version}"
     printf 'Downloading 5tratMux %s for %s...\n' "${version}" "${arch}"
-    curl --fail --silent --show-error --location "${url}" -o "${archive}"
+    curl --fail --silent --show-error --location \
+      --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${DOWNLOAD_MAX_TIME}" \
+      "${url}" -o "${archive}" \
+      || die "the signed ${arch} archive could not be downloaded; the installed version was not changed"
   fi
   printf '%s  %s\n' "${digest}" "${archive}" | sha256sum --check --status \
     || die "OCI archive checksum verification failed"
@@ -731,27 +911,7 @@ install_release() {
   fi
 
   if ! activate_release "${image}" "${channel}"; then
-    if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-      docker container rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 \
-        || die "new release failed; could not remove its container for restoration"
-    else
-      local remaining
-      remaining="$(docker container ls --all --format '{{.Names}}')" \
-        || die "new release failed; could not check container state before restoration"
-      if printf '%s\n' "${remaining}" | grep -Fxq "${CONTAINER_NAME}"; then
-        die "new release failed; could not inspect its container before restoration"
-      fi
-    fi
-    if [[ -n "${backup_name}" ]]; then
-      docker rename "${backup_name}" "${CONTAINER_NAME}" \
-        || die "new release failed; could not restore the previous container name"
-      if power_desired_on; then
-        docker start "${CONTAINER_NAME}" >/dev/null \
-          || die "new release failed; previous container could not be started"
-      else
-        hold_powered_off verify-only || return 1
-      fi
-    fi
+    restore_previous_container "${backup_name}" "new release" || return 1
     if [[ -n "${backup_name}" ]]; then
       die "new release failed its runtime verification; the previous release was restored without changing desired power"
     fi
@@ -767,7 +927,8 @@ install_release() {
   if [[ "${updater_source}" != "${updater_target}" ]]; then
     install -m 0755 "$0" "${updater_target}"
   fi
-  printf '%s\n' "${version}" > "${RUNTIME_DIR}/installed-version"
+  record_installed_version "${version}"
+  cleanup_work_dir
   if power_desired_on; then
     write_status "healthy" "5tratMux ${version} is healthy; licence and trial state were unchanged" "${version}"
   else
@@ -785,7 +946,8 @@ rollback_release() {
     || die "no rollback image is available"
   ensure_config
   configured_dns_servers >/dev/null || die "saved DNS settings are invalid; the installed version was not changed"
-  local rollback_channel
+  restore_interrupted_install
+  local rollback_channel backup_name=""
   rollback_channel="$(
     docker image inspect \
       --format '{{ index .Config.Labels "com.5tratumos.channel" }}' \
@@ -793,10 +955,23 @@ rollback_release() {
   )"
   rollback_channel="${rollback_channel:-DEV}"
   if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-    docker container rm --force "${CONTAINER_NAME}" >/dev/null
+    # Keep the current release until the rollback image proves itself.
+    docker stop "${CONTAINER_NAME}" >/dev/null \
+      || die "could not stop the current container; rollback was not applied"
+    backup_name="${CONTAINER_NAME}-previous-$(date +%s)"
+    docker rename "${CONTAINER_NAME}" "${backup_name}" \
+      || die "could not preserve the current container for restoration"
   fi
-  activate_release 5tratmux:rollback "${rollback_channel}" \
-    || die "rollback image failed runtime verification"
+  if ! activate_release 5tratmux:rollback "${rollback_channel}"; then
+    restore_previous_container "${backup_name}" "rollback" || return 1
+    if [[ -n "${backup_name}" ]]; then
+      die "rollback image failed runtime verification; the current release was restored without changing desired power"
+    fi
+    die "rollback image failed runtime verification"
+  fi
+  if [[ -n "${backup_name}" ]]; then
+    docker container rm "${backup_name}" >/dev/null
+  fi
   if power_desired_on; then
     write_status "healthy" "The previous verified 5tratMux release is healthy" "$(installed_version)"
   else
@@ -810,11 +985,12 @@ check_release() {
   write_status "checking" "Checking the signed 5tratMux release channel" ""
   write_public_key
   local work available installed
-  work="$(mktemp -d)"
-  trap 'rm -rf "${work:-}"' EXIT
+  new_work_dir
+  work="${UPDATER_WORK_DIR}"
   download_manifest "${work}"
   available="$(manifest_value "${work}/manifest.json" version)"
   installed="$(installed_version)"
+  cleanup_work_dir
   printf 'Installed: %s\nAvailable: %s\n' "${installed}" "${available}"
   if [[ "${installed}" = "not-installed" ]] \
     || [[ "$(version_key "${available}")" > "$(version_key "${installed}")" ]]; then
@@ -842,6 +1018,7 @@ bootstrap_release() {
   require_root
   require_commands
   ensure_config
+  restore_interrupted_install
   local installed
   installed="$(installed_version)"
   if ! power_desired_on; then
@@ -867,7 +1044,7 @@ bootstrap_release() {
 }
 
 health_ready() {
-  curl --fail --silent --show-error --max-time 8 "${HEALTH_URL}" >/dev/null 2>&1
+  curl --fail --silent --show-error --connect-timeout 3 --max-time 8 "${HEALTH_URL}" >/dev/null 2>&1
 }
 
 updater_busy() {
@@ -942,6 +1119,7 @@ watchdog_once() {
   sleep 5
   health_ready && return 0
 
+  restore_interrupted_install
   local container=""
   if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
     container="${CONTAINER_NAME}"
@@ -984,9 +1162,19 @@ watchdog_release() {
 
 case "${1:---check}" in
   --check) check_release ;;
-  --install|--update) with_lifecycle_lock install_release ;;
+  --install|--update)
+    if [[ $# -ge 2 ]]; then
+      [[ $# -eq 2 && "$2" = "--allow-downgrade" ]] || die "usage: $1 [--allow-downgrade]"
+      ALLOW_DOWNGRADE=1
+    fi
+    with_lifecycle_lock install_release
+    ;;
   --install-bundle)
-    [[ $# -eq 2 && -n "$2" && -d "$2" ]] || die "usage: --install-bundle DIRECTORY"
+    if [[ $# -eq 3 && "$3" = "--allow-downgrade" ]]; then
+      ALLOW_DOWNGRADE=1
+      set -- "$1" "$2"
+    fi
+    [[ $# -eq 2 && -n "$2" && -d "$2" ]] || die "usage: --install-bundle DIRECTORY [--allow-downgrade]"
     with_lifecycle_lock --wait-bundle install_release "$2"
     ;;
   --bootstrap) with_lifecycle_lock bootstrap_release ;;
@@ -994,7 +1182,7 @@ case "${1:---check}" in
   --rollback) with_lifecycle_lock rollback_release ;;
   --status) status_release ;;
   --help|-h)
-    printf 'Usage: %s --check|--install|--install-bundle DIRECTORY|--bootstrap|--watchdog|--rollback|--status\n' "$0"
+    printf 'Usage: %s --check|--install [--allow-downgrade]|--install-bundle DIRECTORY [--allow-downgrade]|--bootstrap|--watchdog|--rollback|--status\n' "$0"
     ;;
   *) die "unknown option: $1" ;;
 esac
