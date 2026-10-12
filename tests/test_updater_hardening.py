@@ -151,16 +151,15 @@ wait_for_health() { printf health >> "$TEST_ROOT/health"; return ''' + ('0' if h
         self.assertEqual(config.stat().st_mode & 0o777, 0o600)
         return config.read_text().splitlines()
 
-    def test_new_config_binds_loopback(self):
+    def test_new_config_keeps_lan_ui_port(self):
         lines = self.config_run()
-        self.assertIn('APP_HOST=127.0.0.1', lines)
-        self.assertNotIn('APP_HOST=0.0.0.0', lines)
+        self.assertIn('APP_HOST=0.0.0.0', lines)
         self.assertIn('APP_PUBLIC_HOST=192.0.2.5', lines)
         self.assertTrue(any(l.startswith('MUX_LICENSING_PUBLIC_KEY=') and len(l) > 30 for l in lines))
 
-    def test_existing_lan_config_is_migrated_and_key_added(self):
+    def test_existing_config_keeps_app_host_and_gets_key(self):
         lines = self.config_run('APP_HOST=0.0.0.0\nAPP_PORT=21222\nAPP_PUBLIC_HOST=10.0.0.9\nCUSTOM=kept\n')
-        self.assertIn('APP_HOST=127.0.0.1', lines); self.assertNotIn('APP_HOST=0.0.0.0', lines)
+        self.assertIn('APP_HOST=0.0.0.0', lines); self.assertNotIn('APP_HOST=127.0.0.1', lines)
         self.assertIn('APP_PUBLIC_HOST=192.0.2.5', lines); self.assertIn('CUSTOM=kept', lines)
         keys = [l for l in lines if l.startswith('MUX_LICENSING_PUBLIC_KEY=')]
         self.assertEqual(keys, ['MUX_LICENSING_PUBLIC_KEY=I_aujMd069Ki6ZYDw-qhQDQWM0JX5ymizbg7pqVakkE'])
