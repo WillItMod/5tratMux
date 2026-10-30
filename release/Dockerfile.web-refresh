@@ -1,0 +1,11 @@
+# Reuse the exact verified native runtime and browser filesystem. The builder
+# records and checks the parent image ID and every rootfs layer before export.
+ARG VERIFIED_PARENT=scratch
+FROM ${VERIFIED_PARENT}
+ARG APP_VERSION
+ARG PARENT_CONFIG_DIGEST
+ENV APP_VERSION=${APP_VERSION}
+LABEL org.opencontainers.image.version="${APP_VERSION}" \
+      com.5tratumos.metadata-parent-config="${PARENT_CONFIG_DIGEST}" \
+      com.5tratumos.native-source-revision="07a36c699b9da74614b4fa7e5abfebef9e5f6ced" \
+      com.5tratumos.release-refresh="metadata-only"
