@@ -77,6 +77,7 @@ DOWNLOAD_MAX_TIME="${MUX_DOWNLOAD_MAX_TIME:-1800}"
 HIGHEST_VERSION_FILE="${RUNTIME_DIR}/highest-installed-version"
 # Set only by the explicit --allow-downgrade CLI flag.
 ALLOW_DOWNGRADE=0
+WEB_CHECK_CONTAINER=""
 UPDATER_WORK_DIR=""
 UPDATER_STATUS_BUSY=0
 WATCHDOG_STATE_DIR="${MUX_WATCHDOG_STATE_DIR:-/var/lib/5tratumos/5tratmux-watchdog}"
@@ -171,6 +172,7 @@ PY
 
 updater_exit_trap() {
   local rc=$?
+  cleanup_web_check_container || true
   if [[ -n "${UPDATER_WORK_DIR}" ]]; then
     rm -rf -- "${UPDATER_WORK_DIR}" || true
     UPDATER_WORK_DIR=""
@@ -191,10 +193,198 @@ new_work_dir() {
 }
 
 cleanup_work_dir() {
+  cleanup_web_check_container || return 1
   if [[ -n "${UPDATER_WORK_DIR}" ]]; then
     rm -rf -- "${UPDATER_WORK_DIR}"
     UPDATER_WORK_DIR=""
   fi
+}
+
+# Candidate checks use a stopped, isolated container with no installation
+# state mounted. Bound Docker calls and never execute the MUX process here,
+# including when the operator has saved power Off.
+web_check_docker() {
+  python3 - "$@" <<'PYDOCKER'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(["docker", *sys.argv[1:]], timeout=30, check=False)
+    sys.exit(result.returncode)
+except (OSError, subprocess.TimeoutExpired):
+    sys.stderr.write("The candidate web asset inspection did not finish.\n")
+    sys.exit(1)
+PYDOCKER
+}
+
+cleanup_web_check_container() {
+  [[ -n "${WEB_CHECK_CONTAINER}" ]] || return 0
+  web_check_docker container rm --force --volumes "${WEB_CHECK_CONTAINER}" >/dev/null \
+    || return 1
+  WEB_CHECK_CONTAINER=""
+}
+
+# Docker's stdout is a tar stream. Inspect its header before writing any asset,
+# so a large or linked candidate cannot consume unbounded temporary storage.
+web_check_copy() {
+  python3 - "$@" <<'PYCOPY'
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import threading
+
+container, source, destination, limit, remaining = sys.argv[1:]
+limit, remaining = int(limit), int(remaining)
+target = Path(destination)
+process = None
+timer = None
+created = False
+try:
+    process = subprocess.Popen(["docker", "cp", f"{container}:{source}", "-"], stdout=subprocess.PIPE)
+    timer = threading.Timer(30, process.kill)
+    timer.start()
+    class BoundedStream:
+        # Include a small allowance for tar headers and padding, while also
+        # bounding extended metadata before tarfile interprets it.
+        remaining = min(limit, remaining) + 65536
+        def read(self, size):
+            data = process.stdout.read(min(size, self.remaining + 1))
+            if len(data) > self.remaining:
+                raise ValueError("A browser asset archive exceeded its transfer limit.")
+            self.remaining -= len(data)
+            return data
+    with tarfile.open(fileobj=BoundedStream(), mode="r|", bufsize=512) as archive:
+        member = archive.next()
+        if (member is None or not member.isfile()
+                or member.name not in {target.name, "./" + target.name}
+                or member.size <= 0 or member.size > min(limit, remaining)):
+            raise ValueError("A browser asset is linked, oversized or has an unexpected archive path.")
+        stream = archive.extractfile(member)
+        with target.open("xb") as output:
+            created = True
+            copied = 0
+            while copied < member.size:
+                chunk = stream.read(min(65536, member.size - copied))
+                if not chunk:
+                    raise ValueError("A browser asset copy ended before its declared size.")
+                output.write(chunk)
+                copied += len(chunk)
+        if archive.next() is not None:
+            raise ValueError("A browser asset copy contained more than one file.")
+    if process.wait() != 0:
+        raise ValueError("Docker could not copy a required browser asset.")
+    print(copied)
+except (OSError, ValueError, tarfile.TarError) as exc:
+    if created:
+        target.unlink(missing_ok=True)
+    sys.stderr.write(f"5tratMux browser asset copy failed: {exc}\n")
+    sys.exit(1)
+finally:
+    if timer is not None:
+        timer.cancel()
+    if process is not None:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdout.close()
+PYCOPY
+}
+
+web_asset_tree() {
+  python3 - "$1" "${2:-verify}" <<'PYWEB'
+from html.parser import HTMLParser
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+import re
+import sys
+
+root = Path(sys.argv[1]).resolve()
+
+def read_asset(relative, limit):
+    path = root / relative
+    if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root):
+        raise ValueError("A required browser asset is missing or is a link.")
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if not data or len(data) > limit or b"\0" in data:
+        raise ValueError("A required browser asset is empty or exceeds its size limit.")
+    return data.decode("utf-8")
+
+class Assets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paths = {}
+        self.html = False
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        if tag == "html":
+            self.html = True
+        if tag == "base":
+            raise ValueError("The browser page must use document-relative assets.")
+        reference = None
+        if tag == "script" and "src" in attrs:
+            reference, suffixes = attrs["src"], {".js", ".mjs"}
+        elif tag == "link" and "stylesheet" in (attrs.get("rel") or "").lower().split():
+            reference, suffixes = attrs.get("href"), {".css"}
+        if reference is None:
+            if tag == "link" and "stylesheet" in (attrs.get("rel") or "").lower().split():
+                raise ValueError("A stylesheet reference is missing.")
+            return
+        url = urlsplit(reference)
+        path = PurePosixPath(url.path)
+        if (url.scheme or url.netloc or not url.path
+                or url.path.startswith("/") or ".." in path.parts
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", url.path)
+                or path.suffix not in suffixes):
+            raise ValueError("Browser CSS and scripts must stay below the document path.")
+        self.paths[str(path)] = True
+
+try:
+    page = read_asset("index.html", 1024 * 1024)
+    if not page.lstrip().lower().startswith("<!doctype html"):
+        raise ValueError("The browser index is not an HTML document.")
+    assets = Assets()
+    assets.feed(page)
+    assets.close()
+    if not assets.html or not {"app.css", "app.js"}.issubset(assets.paths):
+        raise ValueError("The browser index lacks its required CSS or script.")
+    if len(assets.paths) > 64:
+        raise ValueError("The browser index has too many assets.")
+    if sys.argv[2] == "list":
+        print("\n".join(assets.paths))
+    else:
+        for relative in assets.paths:
+            body = read_asset(relative, 8 * 1024 * 1024)
+            if body.lstrip().startswith("<"):
+                raise ValueError("A browser CSS or script asset contains an HTML response.")
+except (OSError, UnicodeError, ValueError) as exc:
+    sys.stderr.write(f"5tratMux browser asset verification failed: {exc}\n")
+    sys.exit(1)
+PYWEB
+}
+
+verify_candidate_web_assets() {
+  local image="$1" web="${UPDATER_WORK_DIR}/web" relative paths copied total=0
+  local total_limit=$((32 * 1024 * 1024))
+  mkdir -p "${web}" || return 1
+  # Remember the name before contacting Docker: a lost create response can still
+  # leave a container behind, and the exit trap must be able to remove it.
+  WEB_CHECK_CONTAINER="5tratmux-web-check-$(python3 -c 'import secrets; print(secrets.token_hex(12))')" || return 1
+  web_check_docker create --name "${WEB_CHECK_CONTAINER}" --network none --read-only \
+    --entrypoint /bin/true "${image}" >/dev/null || return 1
+  copied="$(web_check_copy "${WEB_CHECK_CONTAINER}" /app/static/index.html "${web}/index.html" \
+    $((1024 * 1024)) "${total_limit}")" || return 1
+  total=$((total + copied))
+  paths="$(web_asset_tree "${web}" list)" || return 1
+  while IFS= read -r relative; do
+    mkdir -p "${web}/$(dirname "${relative}")" || return 1
+    copied="$(web_check_copy "${WEB_CHECK_CONTAINER}" "/app/static/${relative}" "${web}/${relative}" \
+      $((8 * 1024 * 1024)) "$((total_limit - total))")" || return 1
+    total=$((total + copied))
+  done <<< "${paths}"
+  web_asset_tree "${web}" || return 1
+  cleanup_web_check_container
 }
 
 power_desired_on() {
@@ -886,6 +1076,14 @@ install_release() {
   docker load --input "${archive}" >/dev/null || die "verified archive could not be loaded"
   docker image inspect "${image}" >/dev/null \
     || die "verified archive did not contain ${image}"
+  # Releases from 0.9.87 serve both their direct LAN URL and the portal's
+  # /mux/ prefix. Keep older explicit install/rollback behavior unchanged.
+  local prefix_web_key
+  prefix_web_key="$(version_key 0.9.87)"
+  if [[ "${available_key}" = "${prefix_web_key}" || "${available_key}" > "${prefix_web_key}" ]]; then
+    verify_candidate_web_assets "${image}" \
+      || die "the signed candidate's browser assets failed verification; the installed runtime was preserved"
+  fi
 
   write_status "installing" "Installing 5tratMux ${version}; settings and licence state are preserved" "${version}"
   current_image=""

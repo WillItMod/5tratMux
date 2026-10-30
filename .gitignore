@@ -1,1 +1,4 @@
 release/staging/
+.cache/
+__pycache__/
+*.py[cod]
