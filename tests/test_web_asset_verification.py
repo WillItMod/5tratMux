@@ -169,7 +169,7 @@ elif a[0]=='update':''')
 
     def test_asset_parser_rejects_unsafe_paths_empty_files_and_non_html_index(self):
         original = self.index.read_text()
-        for reference in ('/app.js', '//other.invalid/app.js', '../app.js',
+        for reference in ('/app.js', '//other.invalid/app.js', '../app.js', 'nested/app.js',
                           'https://other.invalid/app.js', 'app%2Ejs'):
             with self.subTest(reference=reference):
                 self.index.write_text(original.replace('app.js?v=127', reference))

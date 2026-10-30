@@ -335,7 +335,10 @@ class Assets(HTMLParser):
         path = PurePosixPath(url.path)
         if (url.scheme or url.netloc or not url.path
                 or url.path.startswith("/") or ".." in path.parts
-                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", url.path)
+                # The native web builder emits scripts/styles in one flat
+                # directory. A nested image path could hide a parent symlink
+                # when Docker copies only the leaf into the inspection tree.
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", url.path)
                 or path.suffix not in suffixes):
             raise ValueError("Browser CSS and scripts must stay below the document path.")
         self.paths[str(path)] = True
